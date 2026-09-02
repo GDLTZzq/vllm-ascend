@@ -156,21 +156,46 @@ class PivotIndexer:
         N_in = q_li.shape[0]
         q_dq = q_li[:D]  # raw BF16 [D, H, Dh] (no hadamard/quant on this path)
 
-        # ---- 1. mean proxy (segment mean over each request's g queries) --
+        # ---- 1. mean proxy + 2. coarse screen: K rows -> 4096 ----------
+        # Optionally fused into the npu_indexer_coarse_screen op (Stage-1
+        # group-mean proxy pooling of g query rows + Stage-2 full-prefix
+        # top-4096). Same score formula (sum_h w_bar * relu(q_bar . k)) over
+        # the full [0, L+g) prefix; the SFA attention kernel applies
+        # causality downstream. Off by default (VLLM_ASCEND_PIVOT_COARSE_USE_OP=0)
+        # until it passes its NPU probe; on any op failure we fall back to the
+        # torch reference so the decode path keeps serving.
         H, Dh = q_dq.shape[1], q_dq.shape[2]
-        q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
-        w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
-
-        # ---- 2. coarse screen: torch proxy scan, K rows -> 4096 ----------
-        # Done in torch (not the native npu_lightning_indexer) so the
-        # candidate superset is _COARSE_BUDGET (4096, the paper's number)
-        # rather than the native 2048 sparse_count hard limit. Same score
-        # formula (sum_h w_bar * relu(q_bar . k)) over the full [0, L+g)
-        # prefix; the SFA attention kernel applies causality downstream.
-        C = _coarse_screen(
-            q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
-            attn_metadata.block_size, seq_lens[:K],
-        )
+        if envs.VLLM_ASCEND_PIVOT_COARSE_USE_OP:
+            try:
+                row_weights = torch.ones(K, g, dtype=torch.bfloat16, device=device)
+                C = torch.ops._C_ascend.npu_indexer_coarse_screen(
+                    q_dq,
+                    kv_cache[2],
+                    weights[:D],
+                    row_weights,
+                    actual_seq_lengths_query=cum[:K],
+                    actual_seq_lengths_key=seq_lens[:K],
+                    block_table=attn_metadata.block_table[:K],
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=_COARSE_BUDGET,
+                )  # [K, 1, _COARSE_BUDGET] int32, 0-based, -1 padded
+                C = C.view(K, _COARSE_BUDGET)
+            except Exception as e:
+                logger.warning("PIVOT coarse op failed, falling back to torch: %s", e)
+                q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
+                w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
+                C = _coarse_screen(
+                    q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
+                    attn_metadata.block_size, seq_lens[:K],
+                )
+        else:
+            q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
+            w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
+            C = _coarse_screen(
+                q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
+                attn_metadata.block_size, seq_lens[:K],
+            )
 
         # ---- 3. refine: broadcast C, score, top-k -------------------------
         # Query row -> request id within the decode segment (the leading run
