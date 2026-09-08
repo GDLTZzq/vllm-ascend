@@ -169,6 +169,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitTilingData(const Inde
     constInfo.kCacheBlockSize = tilingData->blockSize;
     constInfo.maxBlockNumPerBatch = tilingData->maxBlockNumPerBatch;
     constInfo.sparseCount = tilingData->sparseCount; // = coarse_count(输出 topk 宽度,4096)
+    constInfo.gMax = tilingData->gMax;               // 本地窗 group 宽上界 = row_weights.dim1(窗宽 g,窗宽上界)
+    constInfo.outRowWidth = tilingData->outRowWidth; // Align8(sparseCount + 2*gMax - 1), 输出单行宽(有效 + -1 pad)
     constInfo.preTokens = INT64_MAX;
     constInfo.nextTokens = INT64_MAX;
     constInfo.returnValue = false;
@@ -238,10 +240,21 @@ template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::GetS1S2ActualSeqLen(uint32_t bIdx,
                                                              uint32_t &actS1Size, uint32_t &actS2Size)
 {
-    // coarse 语义:每请求 1 行代理(q_bar),S1 恒为 1;S2 = 请求内逻辑 key 长度 L+g(非累加 PA_BSND)
+    // coarse 融合语义(域 [0,L)):每请求 1 行代理(q_bar),S1 恒为 1。
+    // 组宽 g_r = aslq cum 差分(与 PreprocessMean 同取法);L = 自然长度(aslk) − g_r。
+    // S2 = 域长 L(非累加 PA_BSND):cube PA 读、子片数随 L 收缩,自有 token 永不入粗筛。
     actS1Size = 1;
-    actS2Size =
+    uint32_t seqLen =
         GetActualSeqLen(bIdx, constInfo.actualLenDims, constInfo.isAccumSeqS2, actualSeqLengthsGm, constInfo.kSeqSize);
+    uint32_t gR = constInfo.gMax;
+    if (constInfo.actualLenQDims != 0) {
+        uint32_t cumPrev = (bIdx == 0) ? 0 : actualSeqLengthsGmQ.GetValue(bIdx - 1);
+        uint32_t cumDiff = actualSeqLengthsGmQ.GetValue(bIdx) - cumPrev;
+        if (cumDiff > 0 && cumDiff < gR) {
+            gR = cumDiff;
+        }
+    }
+    actS2Size = (seqLen > gR) ? (seqLen - gR) : 0;
 }
 
 template <typename LIT>
@@ -269,15 +282,15 @@ __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetTotalBaseBlockNum(
         GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size);
         s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
         if (!constInfo.attenMaskFlag) {
-            s2BaseNum = constInfo.isSparseCountOver2K
-                      ? (actS2Size > 0 ? 1 : 0)
-                      : CeilDiv(actS2Size, constInfo.s2BaseSize);
+            // 域 [0,L) 下 L 可能为 0(seq_lens==g_r):仍需计 1 块使该请求被某核拥有,
+            // 主流水对 L==0 走 DealActSeqLenIsZero 发窗行,故 over2k 每请求恒 1 块。
+            s2BaseNum = constInfo.isSparseCountOver2K ? 1 : CeilDiv(actS2Size, constInfo.s2BaseSize);
             totalBlockNum += s1GBaseNum * s2BaseNum * constInfo.kHeadNum;
             continue;
         }
         for (uint32_t s1gIdx = 0; s1gIdx < s1GBaseNum; s1gIdx++) {
             s2BaseNum = constInfo.isSparseCountOver2K
-                      ? (actS2Size > 0 ? 1 : 0)
+                      ? 1
                       : GetS2BaseBlockNumOnMask(s1gIdx, actS1Size, actS2Size);
             totalBlockNum += s2BaseNum * constInfo.kHeadNum;
         }
@@ -327,7 +340,8 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                 info.s2Start = 0;
                 findLastCoreEnd = false;
             }
-            s2Loop = constInfo.isSparseCountOver2K ? (actS2Size > 0 ? 1 : 0) : s2BaseNum;
+            // over2k 每请求 1 块(L==0 也计 1,交由 DealActSeqLenIsZero 发窗行)
+            s2Loop = constInfo.isSparseCountOver2K ? 1 : s2BaseNum;
             for (uint32_t s2Idx = 0; s2Idx < s2Loop;) {
                 if (findLastCoreEnd) {
                     info.bN2Start = bN2Idx;
@@ -339,8 +353,9 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                 if (lastGS1RemainBlockCnt + s2RemainBaseNum >= coreDealBlockCnt) {
                     info.bN2End = bN2Idx;
                     info.gS1End = gS1Idx;
+                    // L==0 时 s2BaseNum==0,s2End 置 0(主流水短接不消费);正常请求 = 全子片末片
                     info.s2End = constInfo.isSparseCountOver2K
-                               ? s2BaseNum - 1
+                               ? (s2BaseNum > 0 ? s2BaseNum - 1 : 0)
                                : s2Idx + coreDealBlockCnt - lastGS1RemainBlockCnt - 1;
 
                     if (coreIdx == curCoreIdx) {
@@ -375,19 +390,21 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::DealActSeqLenIsZero(uint3
 {
     if ASCEND_IS_AIV {
         if (constInfo.outputLayout == LI_LAYOUT::TND) {
-            // coarse 语义:输出按请求索引 [K,1,sparse_count],actS1Size 恒为 1,每请求仅 1 行
+            // L==0(seq_lens==g_r,域空):输出该请求自有窗行 [0,g_r) 后 -1 pad 至 outRowWidth,
+            // actS1Size 恒为 1 每请求仅 1 行(双 AIV 冗余写同内容,值一致,与旧 CleanInvalidOutput 同构)。
             for (uint32_t s1Idx = s1Start; s1Idx < tempLoopInfo.actS1Size; s1Idx++) {
                 uint64_t indiceOutOffset =
-                    bIdx * constInfo.kHeadNum * constInfo.sparseCount + // B轴(请求)偏移
-                    n2Idx * constInfo.sparseCount;                       // N2轴偏移
-                vectorService.CleanInvalidOutput(indiceOutOffset);
+                    (uint64_t)bIdx * constInfo.kHeadNum * constInfo.outRowWidth + // B轴(请求)偏移
+                    (uint64_t)n2Idx * constInfo.outRowWidth;                      // N2轴偏移
+                vectorService.WriteZeroRow(bIdx, indiceOutOffset);
             }
         } else if (constInfo.outputLayout == LI_LAYOUT::BSND) {
             for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
                 // B,S1,N2,K
-                uint64_t indiceOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount +
-                                           s1Idx * constInfo.kHeadNum * constInfo.sparseCount + // B轴、S1轴偏移
-                                           n2Idx * constInfo.sparseCount;                       // N2轴偏移
+                uint64_t indiceOutOffset = (uint64_t)bIdx * constInfo.qSeqSize * constInfo.kHeadNum *
+                                               constInfo.outRowWidth +
+                                           (uint64_t)s1Idx * constInfo.kHeadNum * constInfo.outRowWidth + // B轴、S1轴偏移
+                                           (uint64_t)n2Idx * constInfo.outRowWidth; // N2轴偏移
                 vectorService.CleanInvalidOutput(indiceOutOffset);
             }
         }
@@ -567,9 +584,9 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
         keyCoreOffset = tndKeyBIdxOffset + runInfo.n2Idx * constInfo.headDim;
         // B,S1,N1(N2,G)
         weightsCoreOffset = runInfo.bIdx * constInfo.qHeadNum;
-        // B,S1,N2,k/T,N2,k
-        indiceOutCoreOffset = runInfo.bIdx * constInfo.kHeadNum * constInfo.sparseCount +
-                              runInfo.n2Idx * constInfo.sparseCount;
+        // B,S1,N2,W8(行宽 = 8 对齐 outRowWidth,含有效 + -1 pad)
+        indiceOutCoreOffset = (uint64_t)runInfo.bIdx * constInfo.kHeadNum * constInfo.outRowWidth +
+                              (uint64_t)runInfo.n2Idx * constInfo.outRowWidth;
     }
     runInfo.tensorQueryOffset = queryCoreOffset;
     runInfo.tensorKeyOffset = keyCoreOffset + runInfo.s2Idx * constInfo.s2BaseSize * constInfo.kHeadNum
@@ -595,9 +612,9 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
 {
     if ASCEND_IS_AIV {
         uint32_t aivCoreNum = GetBlockNum() * 2; // 2 means c:v = 1:2
-        // coarse 语义:输出 [K,1,sparse_count],每请求仅 1 行
+        // coarse 语义:输出 [K,1,outRowWidth],每请求仅 1 行
         uint64_t totalOutputSize =
-            constInfo.batchSize * constInfo.kHeadNum * constInfo.sparseCount;
+            constInfo.batchSize * constInfo.kHeadNum * constInfo.outRowWidth;
         uint64_t singleCoreSize =
             IndexerCoarseScreenCommon::Align((totalOutputSize + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(OUT_T));
         uint64_t baseSize = tmpBlockIdx * singleCoreSize;

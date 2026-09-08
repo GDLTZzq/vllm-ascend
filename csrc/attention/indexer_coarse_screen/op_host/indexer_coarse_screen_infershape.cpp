@@ -22,10 +22,13 @@ using namespace ge;
 namespace ops {
 constexpr uint32_t QUERY_INDEX = 0;
 constexpr uint32_t KEY_INDEX = 1;
+constexpr uint32_t ROW_WEIGHTS_INDEX = 3;
 constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 4;
 constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 0;
 constexpr uint32_t ATTR_KEY_LAYOUT_INDEX = 1;
 constexpr uint32_t ATTR_SPARSE_COUNT_INDEX = 2;
+constexpr int64_t MAX_GROUP_INFERSHAPE = 16; // 本地窗 group 宽上界(镜像 python _MAX_GROUP)
+constexpr int64_t DIM_ONE = 1;
 
 static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *context)
 {
@@ -37,6 +40,8 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
     OP_CHECK_NULL_WITH_CONTEXT(context, keyShape);
     const gert::Shape *actualSeqQShape = context->GetInputShape(ACTUAL_SEQ_Q_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, actualSeqQShape);
+    const gert::Shape *rowWeightsShape = context->GetInputShape(ROW_WEIGHTS_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, rowWeightsShape);
 
     gert::Shape *sparseIndicesShape = context->GetOutputShape(0);
     OP_CHECK_NULL_WITH_CONTEXT(context, sparseIndicesShape);
@@ -65,11 +70,20 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
         OP_LOGE(context, "Layout TND, queryDims (%zu) must be 3!", queryShape->GetDimNum()),
         return ge::GRAPH_FAILED);
 
-    // 输出 TND 布局 [R, N2(恒 1), coarseCount],R 为 batch(请求数)
+    // 本地窗 group 宽 g = row_weights dim1(∈[1,16]),驱动输出行宽 W8
+    int64_t g = rowWeightsShape->GetDim(DIM_ONE);
+    OP_CHECK_IF(
+        ((rowWeightsShape->GetDimNum() != 2) || (g <= 0) || (g > MAX_GROUP_INFERSHAPE)),
+        OP_LOGE(context, "row_weights must be rank-2 and its last dim g must be in (0, %ld], but got dim_num=%zu g=%ld.",
+            MAX_GROUP_INFERSHAPE, rowWeightsShape->GetDimNum(), g),
+        return ge::GRAPH_FAILED);
+    // 输出单行宽 = 粗筛 topk 宽 + 本地窗最大新增(自有 g + 尾项去重保留 ≤ g-1) 后 8 对齐
+    int64_t outRowWidth = (*seleced_count + 2 * g - 1 + 7) / 8 * 8;
+    // 输出 TND 布局 [R, N2(恒 1), outRowWidth],R 为 batch(请求数)
     sparseIndicesShape->SetDimNum(3);
     sparseIndicesShape->SetDim(0, actualSeqQShape->GetDim(0)); // 0:Dim R(actual_seq_lengths_query 长度)
     sparseIndicesShape->SetDim(1, keyShape->GetDim(2));         // 1:Dim N(PA_BSND key [BlockNum,BlockSize,N,D])
-    sparseIndicesShape->SetDim(2, *seleced_count);              // 2:Dim K(coarseCount)
+    sparseIndicesShape->SetDim(2, outRowWidth);                 // 2:Dim K(outRowWidth,见上)
     OP_LOGI(context->GetNodeName(), "IndexerCoarseScreen InferShape end.");
 
     return ge::GRAPH_SUCCESS;

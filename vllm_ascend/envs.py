@@ -124,6 +124,45 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the torch _coarse_screen reference for the PIVOT coarse step. Off by
     # default until the op passes its NPU probe (P1 gate).
     "VLLM_ASCEND_PIVOT_COARSE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_USE_OP", "0"))),
+    # Per-query local window (paper Appendix B, decode variant) in the PIVOT
+    # refine DOMAIN: each decode step's pool (proxy top-4096 over [0, L), L =
+    # prefix before this step) is widened by the group's window union
+    # [L-g+1, L+g) -- the g own tokens plus the last g-1 prefix tokens -- and
+    # those entries COMPETE BY SCORE in the refine (paper semantics, not a
+    # forced reserve slot). Off = ablation / rollback switch; the lossless
+    # region (L+g <= 2048) still reproduces the native full prefix
+    # bit-identically either way.
+    "VLLM_ASCEND_PIVOT_LOCAL_WINDOW": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_LOCAL_WINDOW", "1"))),
+    # Capture real PIVOT refine op inputs (+ the torch reference output) to
+    # disk so the single-op replay harness (plans/indexer_refine_realdata_replay.py)
+    # can reproduce a production (step, layer) exactly: precision diff vs the
+    # python implementation AND op-level perf isolation on real shapes.
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP", "0"))),
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR", "/tmp/pivot_refine_dump"),
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX", "8")),
+    # Sample every Nth op invocation (per rank). Without a stride the MAX
+    # quota is consumed by the EARLIEST (step, layer) hits -- early steps
+    # where L+g is still in the sub-512 safe window -- and the interesting
+    # prefix lengths (tail-chunk mixes, >4096 truncation) never get captured.
+    # Example: STRIDE=20, MAX=200 spreads captures over ~4000 invocations.
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE", "1")),
+    # Dump only ONE indexer layer (all indexer layers in a step see highly
+    # similar inputs, so sampling them all just dilutes the stride coverage).
+    # Only layers that own an indexer ever reach the dump code, so the value
+    # must be the layer_name of a real indexer layer. "first" (default) pins
+    # the first indexer layer that shows up. Otherwise an exact layer-name
+    # substring (e.g. "layers.7"). If the substring matches no indexer layer,
+    # the dump logs the real indexer-layer names it sees and falls back to the
+    # current one instead of silently capturing nothing.
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER", "first"),
+    # ---- T5: baseline (non-PIVOT native path) topk characteristic probe ----
+    # Single gate (dump dir / layer roster / rank are module constants inside
+    # pivot_topk_probe.py, not env vars). When on, baseline_topk_probe.capture in
+    # indexer_select_post_process records the native top-2048 indices VERBATIM
+    # (no fp32 re-score -- the baseline output is kept as-is, never touched).
+    # The analyzer emits a TEXT report (json/markdown, no figures) so the
+    # numbers survive off-box transport and can be re-plotted locally.
+    "VLLM_ASCEND_TOPK_PROBE": lambda: bool(int(os.getenv("VLLM_ASCEND_TOPK_PROBE", "0"))),
 }
 
 # end-env-vars-definition

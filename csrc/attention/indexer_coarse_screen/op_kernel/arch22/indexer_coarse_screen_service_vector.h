@@ -74,6 +74,14 @@ public:
                                                 GlobalTensor<W_T> wBarGm, GlobalTensor<uint32_t> actualSeqLengthsGmQ);
     __aicore__ inline void PreprocessMean(uint32_t bStart, uint32_t bEnd);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
+    // 输出行融合写(over2k needCopyOutGm,每请求恰一次,偶数 AIV):
+    //   粗筛 top-min(L,4096) 前段(Extract idx 原序)++ 本地窗 union(尾项去重,自有恒新增,升序)++ -1 pad → 单次全行 CopyOut。
+    //   topkSrc = globalTopkUb_[innerS1Idx*virTopK*2]((value,index) 交错,有效位前连续、尾 -1)。
+    __aicore__ inline void FuseWindowRowOut(uint32_t bIdx, uint64_t gmRowOffset, LocalTensor<float> topkSrc, uint32_t L);
+    // L==0(seq_lens==g_r,域空)请求:自有窗行 [0,g_r) 升序 + -1 pad 至 outRowWidth。
+    __aicore__ inline void WriteZeroRow(uint32_t bIdx, uint64_t gmRowOffset);
+    // 读 aslq cum 差分得本请求组宽 g_r(与 PreprocessMean 同取法,恒宽场景 = gMax)
+    __aicore__ inline uint32_t GetGroupWidthFromCum(uint32_t bIdx);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void InitLDBuffers(TPipe *pipe);
@@ -273,14 +281,130 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::FreeEventID()
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CleanInvalidOutput(int64_t invalidS1offset)
 {
-    // init -1 and copy to output
+    // init -1 and copy to output(整行 outRowWidth,coarse 行宽)
     LocalTensor<float> valueULocal = outQueue_.AllocTensor<float>();
     LocalTensor<int32_t> idxULocal1 = valueULocal.template ReinterpretCast<int32_t>();
-    Duplicate(idxULocal1, constInfo_.INVALID_IDX, constInfo_.sparseCount);
+    Duplicate(idxULocal1, constInfo_.INVALID_IDX, constInfo_.outRowWidth);
     outQueue_.EnQue<float>(valueULocal);
     valueULocal = outQueue_.DeQue<float>();
-    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[invalidS1offset], idxULocal1, constInfo_.sparseCount);
+    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[invalidS1offset], idxULocal1, constInfo_.outRowWidth);
     outQueue_.FreeTensor(valueULocal);
+}
+
+template <typename LIT>
+__aicore__ inline uint32_t IndexerCoarseScreenServiceVector<LIT>::GetGroupWidthFromCum(uint32_t bIdx)
+{
+    // 与 PreprocessMean 同取法:组宽 = aslq cum 差分;防御型取 cumDiff(1,gMax] 内值。
+    // 恒宽 decode 场景 cum 差分恒 = row_weights.dim1 = gMax。
+    uint32_t gR = static_cast<uint32_t>(constInfo_.gMax);
+    if (constInfo_.actualLenQDims != 0) {
+        uint32_t cumPrev = (bIdx == 0) ? 0 : actualSeqLengthsGmQ.GetValue(bIdx - 1);
+        uint32_t cumDiff = actualSeqLengthsGmQ.GetValue(bIdx) - cumPrev;
+        if (cumDiff > 0 && cumDiff < gR) {
+            gR = cumDiff;
+        }
+    }
+    return gR;
+}
+
+// 行缓冲在 tmpUb_ 内(int 别名):粗筛 idx 半区起点 = virTopK(Extract 的 idx 落点),故行 int 基址 = virTopK。
+//   [0, virTopK)        Extract value 半区(后复用为 coarse int→float 区)
+//   [virTopK, 2*virTopK)  Extract idx 半区 = 粗筛 top-min(L,4096) 实值 + 尾部 -1
+//   行区 int [virTopK, virTopK + outRowWidth)(≤ ~4128 ints),与上面余量不冲突
+//   [3*virTopK, 4*virTopK)  presence 差分/sqrt 暂存(float)
+//   [4*virTopK, ...)        ReduceMax 结果(小块)
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::FuseWindowRowOut(uint32_t bIdx, uint64_t gmRowOffset,
+                                                                LocalTensor<float> topkSrc, uint32_t L)
+{
+    const uint32_t span = static_cast<uint32_t>(virTopK);      // Extract 半宽 = 4096
+    const uint32_t scratchF = 3U * span;                        // float 暂存区
+    const uint32_t reduceF = 4U * span;                         // reduce 结果区
+    const uint32_t gR = GetGroupWidthFromCum(bIdx);
+    // 域 [0,L) 空:仅自有窗 [0,gR)(与 WriteZeroRow 等价,防御;正常 L==0 走 DealActSeqLenIsZero)
+    if (L == 0) {
+        WriteZeroRow(bIdx, gmRowOffset);
+        return;
+    }
+    const uint32_t c = (L > span) ? span : L;                   // 粗筛实值数 = min(L, 4096)
+
+    LocalTensor<float> ubF = tmpUb_;
+    LocalTensor<int32_t> rowI = ubF.template ReinterpretCast<int32_t>();
+    // Extract:value→ubF[0,span),idx→int [span, 2span),与生产 CopyOut 路径同构
+    LocalTensor<uint32_t> dstIdx = ubF[span].template ReinterpretCast<uint32_t>();
+    Extract(ubF, dstIdx, topkSrc, span / 32);
+
+    uint32_t st = span + c;                                     // 行窗口追加起点(int 下标)
+    if (L > span) {
+        // 尾项 [L-gR+1, L)(≤ gR-1)逐个判粗筛成员:粗筛 idx(int)→float,平方差 ReduceMax==0 判在集
+        LocalTensor<float> coarseF = ubF;                       // [0,span),复用 value-half
+        LocalTensor<int32_t> coarseIdxInt = rowI[span];         // aarch64 严格模式:提命名变量再作 Cast 源
+        Cast(coarseF, coarseIdxInt, RoundMode::CAST_NONE, span);
+        LocalTensor<float> diffF = ubF[scratchF];
+        LocalTensor<float> redUb = ubF[reduceF];
+        PipeBarrier<PIPE_V>();
+        for (uint32_t p = L - gR + 1; p < L; p++) {
+            Adds(diffF, coarseF, -1.0f * static_cast<float>(p), span);
+            PipeBarrier<PIPE_V>();
+            Mul(diffF, diffF, diffF, span);
+            PipeBarrier<PIPE_V>();
+            ReduceMax(redUb, diffF, diffF, span);
+            PipeBarrier<PIPE_V>();
+            if (redUb.GetValue(0) != 0.0f) {
+                rowI.SetValue(st, static_cast<int32_t>(p));
+                st++;
+            }
+        }
+    }
+    // 自有 token [L, L+gR) 不入域、恒新增,升序追加
+    for (uint32_t j = 0; j < gR; j++) {
+        rowI.SetValue(st, static_cast<int32_t>(L + j));
+        st++;
+    }
+    // -1 pad 至行尾 outRowWidth(8 对齐整段 Duplicate + ≤7 尾标量)
+    const uint32_t rowEnd = span + constInfo_.outRowWidth;
+    uint32_t padStart = (st + 7U) & ~7U;
+    for (uint32_t i = st; i < padStart && i < rowEnd; i++) {
+        rowI.SetValue(i, -1);
+    }
+    if (padStart < rowEnd) {
+        LocalTensor<int32_t> padUb = rowI[padStart];
+        Duplicate(padUb, -1, rowEnd - padStart);
+    }
+    PipeBarrier<PIPE_V>();
+    LocalTensor<int32_t> rowSrc = rowI[span];
+    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[gmRowOffset], rowSrc, constInfo_.outRowWidth);
+    // 2026-09-08 修复:全行 DataCopyPad(MTE3) 读本缓冲后,tmpUb_ 下一请求/子片复用(V/MTE)须等其完成
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+// L==0 请求行:自有窗 [0,gR)(= 请求全部 token,域空),后 -1 pad 至 outRowWidth。
+// 双 AIV 冗余写同内容(值一致),不引入事件;行缓冲同上在 tmpUb_ 内。
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::WriteZeroRow(uint32_t bIdx, uint64_t gmRowOffset)
+{
+    const uint32_t span = static_cast<uint32_t>(virTopK);
+    const uint32_t gR = GetGroupWidthFromCum(bIdx);
+    LocalTensor<float> ubF = tmpUb_;
+    LocalTensor<int32_t> rowI = ubF.template ReinterpretCast<int32_t>();
+    uint32_t st = span;
+    for (uint32_t j = 0; j < gR; j++) {
+        rowI.SetValue(st, static_cast<int32_t>(j));
+        st++;
+    }
+    const uint32_t rowEnd = span + constInfo_.outRowWidth;
+    uint32_t padStart = (st + 7U) & ~7U;
+    for (uint32_t i = st; i < padStart && i < rowEnd; i++) {
+        rowI.SetValue(i, -1);
+    }
+    if (padStart < rowEnd) {
+        LocalTensor<int32_t> padUb = rowI[padStart];
+        Duplicate(padUb, -1, rowEnd - padStart);
+    }
+    PipeBarrier<PIPE_V>();
+    LocalTensor<int32_t> rowSrc = rowI[span];
+    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[gmRowOffset], rowSrc, constInfo_.outRowWidth);
+    AscendC::PipeBarrier<PIPE_ALL>();
 }
 
 // Stage-1 组均值代理池化:对本核对 b 区间 [bStart,bEnd] 逐请求计算
@@ -593,25 +717,36 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             bool needCopyWsGm = info.isLastS2InnerLoop;
 
             if (needCopyOutGm) {
-                // 生产形态 CopyOut: Extract 分离 globalTopkUb_ 的 (value,index) 交错对,
-                // 经 outQueue_ 缓冲后拷贝 idx 到输出。coarse 无 value 输出,只拷贝索引。
-                int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? virTopK : constInfo_.sparseCount / 2;
-                int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
-                                ? constInfo_.sparseCount
-                                : constInfo_.sparseCount / 2;
-                int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
-                for (int64_t i = 0; i < copyNum; i++) {
-                    LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
-                    LocalTensor<uint32_t> outIdxUb = outValueUb[offset].template ReinterpretCast<uint32_t>();
-                    Extract(outValueUb, outIdxUb,
-                            globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset], offset / 32);
-                    LocalTensor<int32_t> idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
-                    outQueue_.EnQue<float>(outValueUb);
-                    outValueUb = outQueue_.DeQue<float>();
-                    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
-                                                                 constInfo_.sparseCount + i * offset],
-                                        idxULocal1, copyLen);
-                    outQueue_.FreeTensor(outValueUb);
+                if (constInfo_.isSparseCountOver2K) {
+                    // 融合窗行输出(每请求恰一次、由偶 AIV 的 innerS1Idx=0 执行):
+                    //   globalTopkUb_ 已持本请求全前缀 top-4096((value,index) 交错)。
+                    //   FuseWindowRowOut 在 tmpUb_ 组行: 粗筛 idx[0,c)(c=min(L,4096)) 前连续
+                    //   ++ 窗新增(去重后) ++ -1 pad, 整行单次 CopyOut 到 [bIdx,n2Idx,outRowWidth]。
+                    LocalTensor<float> fuseSrc = globalTopkUb_[innerS1Idx * virTopK * 2];
+                    FuseWindowRowOut(info.bIdx, info.indiceOutOffset + (uint64_t)cuS1Idx * constInfo_.outRowWidth,
+                                     fuseSrc, info.actS2Size);
+                } else {
+                    // 生产形态 CopyOut: Extract 分离 globalTopkUb_ 的 (value,index) 交错对,
+                    // 经 outQueue_ 缓冲后拷贝 idx 到输出。coarse 无 value 输出,只拷贝索引。
+                    // (host 强制 sparse_count==4096 → 恒 over2k,此分支为死代码保留作模板参照)
+                    int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? virTopK : constInfo_.sparseCount / 2;
+                    int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
+                                    ? constInfo_.sparseCount
+                                    : constInfo_.sparseCount / 2;
+                    int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
+                    for (int64_t i = 0; i < copyNum; i++) {
+                        LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
+                        LocalTensor<uint32_t> outIdxUb = outValueUb[offset].template ReinterpretCast<uint32_t>();
+                        Extract(outValueUb, outIdxUb,
+                                globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset], offset / 32);
+                        LocalTensor<int32_t> idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
+                        outQueue_.EnQue<float>(outValueUb);
+                        outValueUb = outQueue_.DeQue<float>();
+                        IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
+                                                                     constInfo_.outRowWidth + i * offset],
+                                            idxULocal1, copyLen);
+                        outQueue_.FreeTensor(outValueUb);
+                    }
                 }
             } else if (needCopyWsGm) {
                 // vec1Res Gm = [aic, s1BaseSize_, 2, 2, topkOut_] float32
@@ -635,7 +770,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
                 tmpiBuff.SetValue(5, static_cast<int64_t>(info.bN2Idx));
                 tmpiBuff.SetValue(6, static_cast<int64_t>(cuS1Idx));
                 tmpiBuff.SetValue(7, static_cast<int64_t>(cuS1ProcNum));
-                tmpiBuff.SetValue(8, static_cast<int64_t>(info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount));
+                tmpiBuff.SetValue(8, static_cast<int64_t>(info.indiceOutOffset + cuS1Idx * constInfo_.outRowWidth));
                 // 写入头尾判断
                 // [head, tail]
                 // head: 与前面规约，与前后规约
@@ -655,7 +790,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
                 SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
             }
         } else if (cuRealAcSeq <= 0) {
-            CleanInvalidOutput(info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount);
+            CleanInvalidOutput(info.indiceOutOffset + cuS1Idx * constInfo_.outRowWidth);
         }
     }
 
@@ -669,7 +804,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num, 2) : (invalidS1Num / 2);
             int32_t s1OffsetPerAiv = info.actS1Size + (blockId_ % 2) * CeilDiv(invalidS1Num, 2);
             for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
-                CleanInvalidOutput(info.indiceOutOffset + (s1OffsetPerAiv + innerS1Idx) * constInfo_.sparseCount);
+                CleanInvalidOutput(info.indiceOutOffset + (s1OffsetPerAiv + innerS1Idx) * constInfo_.outRowWidth);
             }
         }
 
@@ -679,7 +814,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             int32_t s1OffsetPerAiv = (blockId_ % 2) * CeilDiv(invalidS1Num2, 2);
             for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
                 CleanInvalidOutput((info.bN2Idx * constInfo_.qSeqSize + s1OffsetPerAiv + innerS1Idx) *
-                                   constInfo_.sparseCount);
+                                   constInfo_.outRowWidth);
             }
         }
     }

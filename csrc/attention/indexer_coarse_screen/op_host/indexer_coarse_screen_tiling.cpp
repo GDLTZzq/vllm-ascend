@@ -168,6 +168,12 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
     OP_CHECK_IF(((*opParamInfo_.sparseCount > 2048) && (*opParamInfo_.sparseCount % 1024 != 0)),
                OP_LOGE(opName_, "when sparse_count > 2048, sparse_count must be an integer multiple of 1024."),
                return ge::GRAPH_FAILED);
+    // PIVOT 本地窗融合路径: 粗筛 topk 宽固定 = COARSE_COUNT(4096), 输出单行宽按 W8 语义(见
+    // ValidateInputShapesMatch), 需单 block 内全前缀累加的 2k 拓扑, 其它取值不支持融合窗输出.
+    OP_CHECK_IF((*opParamInfo_.sparseCount != static_cast<int32_t>(COARSE_COUNT)),
+               OP_LOGE(opName_, "PIVOT fused coarse_screen: attr sparse_count must be exactly %u.",
+                   COARSE_COUNT),
+               return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -505,14 +511,20 @@ ge::graphStatus IndexerCoarseScreenInfoParser::ValidateInputShapesMatch()
                        "but now they are %u, %ld respectively.",
                        n2Size_, opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_ONE)),
                return ge::GRAPH_FAILED);
-    // -----------------------check row_weights 宽(g > 0)-------------------
-    OP_CHECK_IF((opParamInfo_.rowWeights.shape->GetStorageShape().GetDim(DIM_IDX_ONE) == 0),
-               OP_LOGE(opName_, "row_weights shape last dim must be greater than 0."),
+    // -----------------------check row_weights 宽(g ∈ [1,16])并求 gMax/outRowWidth-------------------
+    gMax_ = static_cast<uint32_t>(opParamInfo_.rowWeights.shape->GetStorageShape().GetDim(DIM_IDX_ONE));
+    OP_CHECK_IF(((gMax_ == 0) || (gMax_ > MAX_GROUP)),
+               OP_LOGE(opName_, "row_weights shape last dim(g) must be in [1, %u], but now is %u.",
+                   MAX_GROUP, gMax_),
                return ge::GRAPH_FAILED);
-    // -----------------------check coarseCount(输出 topk 宽)-------------------
-    OP_CHECK_IF((opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO) != *opParamInfo_.sparseCount),
-               OP_LOGE(opName_, "output sparse_indices shape last dim must be same as attr sparse_count,"
-                       "but now they are %u, %ld respectively.", static_cast<uint32_t>(*opParamInfo_.sparseCount),
+    sparseCount_ = static_cast<uint32_t>(*opParamInfo_.sparseCount);
+    // 输出单行宽 = 粗筛 topk 宽 + 本地窗最大新增(自有 g + 尾项去重后保留 ≤ g-1) 后 8 对齐
+    outRowWidth_ = AlignUpTo8(sparseCount_ + 2 * gMax_ - 1);
+    // -----------------------check 输出单行宽(恒 = outRowWidth)-------------------
+    OP_CHECK_IF((opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO) != outRowWidth_),
+               OP_LOGE(opName_,
+                   "output sparse_indices shape last dim must be same as outRowWidth(Align8(sparse_count + 2*g - 1)),"
+                       "but now they are %u, %ld respectively.", outRowWidth_,
                        opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO)),
                return ge::GRAPH_FAILED);
 
@@ -542,6 +554,8 @@ void IndexerCoarseScreenInfoParser::GenerateInfo(IndexerCoarseScreenTilingInfo &
     std::string layOutKeyStr(opParamInfo_.layOutKey);
     liInfo.pageAttentionFlag = layOutKeyStr == "PA_BSND" ? true : false;
     liInfo.sparseCount = *opParamInfo_.sparseCount; // coarseCount
+    liInfo.gMax = gMax_;
+    liInfo.outRowWidth = outRowWidth_;
 
     liInfo.inputQLayout = qLayout_;
     liInfo.inputKLayout = kLayout_;
@@ -640,6 +654,8 @@ ge::graphStatus IndexerCoarseScreenTiling::DoTiling(IndexerCoarseScreenTilingInf
     tilingData_.set_gSize(tilingInfo->gSize);
     tilingData_.set_blockSize(tilingInfo->blockSize);
     tilingData_.set_maxBlockNumPerBatch(tilingInfo->maxBlockNumPerBatch);
+    tilingData_.set_gMax(tilingInfo->gMax);
+    tilingData_.set_outRowWidth(tilingInfo->outRowWidth);
     tilingData_.set_usedCoreNum(blockDim);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());

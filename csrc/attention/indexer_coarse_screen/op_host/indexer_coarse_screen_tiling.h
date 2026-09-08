@@ -68,14 +68,22 @@ constexpr uint32_t DIM_NUM_FOUR = 4;
 // 入参限制常量
 constexpr uint32_t HEAD_DIM_LIMIT = 128;
 constexpr uint32_t SPARSE_LIMIT = 8192;          // coarseCount 上限(coarse_screen topk 宽度 ≤ 8192)
-constexpr uint32_t COARSE_COUNT = 4096;          // 候选集宽度(coarse_screen 输出)
+constexpr uint32_t COARSE_COUNT = 4096;          // 候选集宽度(PIVOT 融合路径固定值, topk 累加器/输出粗筛宽)
+constexpr uint32_t MAX_GROUP = 16;               // 本地窗 group 宽上界(镜像 python _MAX_GROUP, 保证窗安全)
+
+// 8 元素对齐(输出行宽,规避 CopyOut/Duplicate/SetValue 的对齐限制)
+inline uint32_t AlignUpTo8(uint32_t x)
+{
+    return (x + 7U) & ~7U;
+}
 
 // -----------算子TilingData定义---------------
 // 字段语义(与 kernel InitTilingData 一一对应):
 //   bSize=R(batchSize=请求数)  gSize=H(query head num,Stage-2 加权归约用)
 //   s1Size=TND 总 query 行(N=g 个 decode 头行/请求,pooling 用)
 //   s2Size=maxBlockNumPerBatch*blockSize(全前缀上界,非候选集宽度)
-//   sparseCount=coarseCount(输出 topk 宽度)
+//   sparseCount=coarseCount(topk 累加器宽度,输出 topk 宽;PIVOT 下恒 4096)
+//   gMax=row_weights.dim1(本地窗 group 宽上界)  outRowWidth=Align8(sparseCount+2*gMax-1) 输出行宽
 //   blockSize=PA block 大小   maxBlockNumPerBatch=block_table 宽(全前缀 gather 用)
 BEGIN_TILING_DATA_DEF(IndexerCoarseScreenTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
@@ -86,6 +94,8 @@ TILING_DATA_FIELD_DEF(uint32_t, sparseCount)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
 TILING_DATA_FIELD_DEF(uint32_t, blockSize)
 TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
+TILING_DATA_FIELD_DEF(uint32_t, gMax)
+TILING_DATA_FIELD_DEF(uint32_t, outRowWidth)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(IndexerCoarseScreen, IndexerCoarseScreenTilingData)
 
@@ -125,7 +135,9 @@ public:
     int32_t blockSize = 0;
     uint32_t maxBlockNumPerBatch = 0;
     // Others Flag
-    uint32_t sparseCount = 0; // coarseCount(输出 topk 宽度)
+    uint32_t sparseCount = 0; // coarseCount(输出 topk 宽度, PIVOT 下恒 4096)
+    uint32_t gMax = 0;        // row_weights.dim1,本地窗 group 宽上界
+    uint32_t outRowWidth = 0; // Align8(sparseCount + 2*gMax - 1),输出单行宽(有效 + -1 pad)
     // DType
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKType = ge::DT_FLOAT16;
@@ -194,6 +206,10 @@ public:
     // PageAttention
     uint32_t maxBlockNumPerBatch_ = 0;
     int32_t blockSize_ = 0;
+    // Others Flag
+    uint32_t sparseCount_ = 0; // coarseCount(输出 topk 宽度)
+    uint32_t gMax_ = 0;        // row_weights.dim1,本地窗 group 宽上界
+    uint32_t outRowWidth_ = 0; // Align8(sparseCount_ + 2*gMax_ - 1),输出单行宽
     platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
     ge::DataType inputQType_ = ge::DT_FLOAT16;
     ge::DataType inputKType_ = ge::DT_FLOAT16;

@@ -6,9 +6,13 @@ this replaces the per-query full-prefix indexer scan with one shared
 mean-proxy coarse screen plus a per-query top-k refine over the candidates:
 
   1. mean proxy  q_bar = mean(q[group])          (torch, graph-safe)
-  2. coarse      C = top-4096 proxy scores over each prefix, computed in
-     screen      torch (not the native op, so the superset can be 4096 --
-                 the paper's number -- instead of the native 2048 limit)
+  2. coarse      C = top-4096 proxy scores over the domain [0, L) with
+     screen      L = seq_lens - g (the group's own g tokens never enter the
+                 pool), by default computed in torch (so the superset can be
+                 the paper's 4096) and completed by the step-2b local window;
+                 with VLLM_ASCEND_PIVOT_COARSE_USE_OP=1 the fused native op
+                 npu_indexer_coarse_screen does pooling + domain-[0, L) coarse
+                 + window union/dedup/compaction and emits the finished row.
   3. refine      broadcast C to each query row, score with the native
                  formula, top-k (k = 2048)
 
@@ -66,6 +70,173 @@ _ENABLE_REPORT = False
 # <= 16-token prefills. The latter are exactly reproducible under PIVOT
 # (their whole prefix fits the lossless window), so admitting them is safe.
 _MAX_GROUP = 16
+
+# Real-data capture state (VLLM_ASCEND_PIVOT_REFINE_DUMP): bounded count, no
+# queue, no background thread -- each capture is one synchronous torch.save
+# of a few MB. STRIDE samples every Nth hit so the MAX quota spreads over the
+# whole run (first-N-hits-only would miss the long-prefix windows entirely).
+# Diagnostics only.
+_dump_count = 0
+_dump_hits = 0
+_dump_layer = None  # pinned at first dump-eligible invocation (or from env)
+# Distinct indexer-layer names first seen (only indexer layers ever reach the
+# dump code, so this doubles as the model's real indexer-layer roster when an
+# explicit DUMP_LAYER guess is wrong).
+_dump_seen: list[str] = []
+_dump_miss_warned = False
+
+
+def _local_rank() -> str:
+    """TP rank for dump sharding (multi-rank writes must not collide)."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return str(dist.get_rank())
+    except Exception:
+        pass
+    import os
+
+    return os.getenv("RANK", os.getenv("LOCAL_RANK", "0"))
+
+
+def _layer_num(name: str) -> int | None:
+    """Last integer run in a layer name, or None if it has no digits.
+
+    Model layer prefixes carry an index (e.g. ``model.layers.7`` or
+    ``model.layers.7.self_attn``); indexer layers execute in ascending index
+    order each decode step. Used to detect when an explicit DUMP_LAYER guess
+    names a layer that does not exist (we pass its index position without ever
+    seeing it) so the dump can warn and fall back instead of capturing nothing.
+    """
+    i = len(name) - 1
+    while i >= 0 and not name[i].isdigit():
+        i -= 1
+    if i < 0:
+        return None
+    j = i
+    while j >= 0 and name[j].isdigit():
+        j -= 1
+    return int(name[j + 1:i + 1])
+
+
+def _dump_gate(layer_name: str) -> bool:
+    """Decide whether to capture THIS (step, layer) invocation.
+
+    Combines the one-layer filter and the stride sampler. Only indexer layers
+    ever call in (sfa_v1.py:1496 has_indexer hard gate), so layer_name is
+    always a real indexer layer; an explicit DUMP_LAYER that names no indexer
+    layer logs the real roster and falls back to the current layer instead of
+    silently capturing nothing. Diagnostics only -- never raises.
+    """
+    global _dump_hits, _dump_layer, _dump_seen, _dump_miss_warned
+    if not envs.VLLM_ASCEND_PIVOT_REFINE_DUMP:
+        return False
+    if _dump_count >= envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX:
+        return False
+    if _dump_layer is None:
+        want = envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER
+        if want == "first" or want in layer_name:
+            _dump_layer = layer_name
+        elif want != "first":
+            # _dump_seen doubles as the model's real indexer-layer roster.
+            if layer_name not in _dump_seen:
+                _dump_seen.append(layer_name)
+                logger.info_once(
+                    "PIVOT dump: DUMP_LAYER=%r not matched yet; indexer "
+                    "layer %s present (real indexer layers so far: %s)",
+                    want, layer_name, ", ".join(_dump_seen))
+            # Layers run in ascending index order each step: once a layer
+            # numerically past the target has appeared, the target (a dense
+            # layer) can never come. Fall back to the current real indexer
+            # layer so the run still captures data.
+            tw = _layer_num(want)
+            if (not _dump_miss_warned and tw is not None
+                    and any(_layer_num(l) is not None and _layer_num(l) > tw
+                            for l in _dump_seen)):
+                _dump_miss_warned = True
+                logger.warning(
+                    "PIVOT dump: DUMP_LAYER=%r matches no indexer layer "
+                    "(real ones seen: %s); falling back to %s so the run "
+                    "still captures data.",
+                    want, ", ".join(_dump_seen), layer_name)
+                _dump_layer = layer_name
+    if _dump_layer != layer_name:
+        return False
+    _dump_hits += 1
+    return (_dump_hits - 1) % envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE == 0
+
+
+def _dump_real_inputs(q_dq, weights, C, req_ids, aslq, aslk, kv_cache,
+                      block_table, block_size, layer_hint, op_topk,
+                      aslk_op=None):
+    """Persist one real op invocation + BOTH outputs for offline replay.
+
+    Saves the exact tensors the op consumes (query/weights/candidates/aslq/
+    aslk) plus the KV rows the op can reach (only slots referenced by
+    candidates, ~c rows per request) and the REAL block table, so the replay
+    harness rebuilds the production PA layout faithfully. Saves BOTH
+    outputs for the same inputs:
+      - op_topk: the op's raw answer ([D, 1, 2048] candidate COLUMN indices,
+        before the caller gather) -- replaying the same inputs and diffing
+        against this catches nondeterminism/races bit-exactly;
+      - ref_topk: the python _refine_topk answer (positions) -- the
+        precision reference the op is supposed to match after gather.
+    TP safe: files land in <dir>/rank<N>/ so concurrent ranks never
+    overwrite each other (each rank's inputs differ under TP).
+    Never raises -- diagnostics must not take down the decode path.
+
+    aslk vs aslk_op: `aslk` is the RAW seq length (L+g) kept for the replay
+    oob bound / reporting; `aslk_op` is the CLAMPED value the op actually
+    received (clamp to C row width -- the op's S2 loop walks the candidate
+    list over [0, aslk), so an unclamped L+g > C.shape[1] reads past the row
+    end). The replay MUST feed aslk_op back, not the raw aslk; persisting the
+    exact consumed value here is what makes the determinism diff meaningful.
+    """
+    global _dump_count
+    import os
+
+    _dump_count += 1
+    idx = _dump_count
+    try:
+        out_dir = os.path.join(
+            envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR, f"rank{_local_rank()}")
+        os.makedirs(out_dir, exist_ok=True)
+        # Token-major rows of the PA_BSND K cache, flattened EXACTLY as
+        # _refine_topk consumes it (view(-1, Dh), slot = block_table[r,
+        # pos//bs]*bs + pos%bs). NOT view(kv_cache[2].shape[0], -1): that
+        # flattens on the BLOCK axis and leaves each row a whole block
+        # (bs * Dh wide), which the replay rebuild (token rows of Dh) cannot
+        # scatter back -- that shape mismatch was the dump bug.
+        kc = kv_cache[2].view(-1, kv_cache[2].shape[-1])  # [B*bs, Dh]
+        # slots referenced by valid candidate positions (per request)
+        c64 = C.to(torch.int64).clamp(min=0)
+        blk = (c64 // block_size)
+        slots = (block_table.to(torch.int64).gather(1, blk) * block_size
+                 + c64 % block_size).reshape(-1)
+        slots = slots.unique()
+        ref = _refine_topk(q_dq, weights, C, req_ids, kv_cache, block_table,
+                           block_size, q_dq.shape[0])
+        if aslk_op is None:
+            aslk_op = torch.clamp(aslk, max=C.shape[1])
+        torch.save(
+            {
+                "q_dq": q_dq.cpu(), "weights": weights.cpu(),
+                "C": C.cpu(), "aslq": aslq.cpu(), "aslk": aslk.cpu(),
+                # op 实收的 clamp 后 aslk(见 docstring)——replay 必须喂这个,
+                # 不是上面 raw 的 aslk(L+g > C 宽时两者分叉)。
+                "aslk_op": aslk_op.cpu(),
+                "block_table": block_table.cpu(), "block_size": block_size,
+                "kv_slots": slots.cpu(), "kv_rows": kc[slots].cpu(),
+                "kv_num_rows": kc.shape[0],
+                "op_topk": op_topk.detach().cpu(),  # raw cols, pre-gather
+                "ref_topk": ref.cpu(), "layer": layer_hint,
+            },
+            os.path.join(out_dir, f"cap_{idx:04d}.pt"))
+        logger.info("PIVOT refine dump %d saved to %s (layer=%s, D=%d)",
+                    idx, out_dir, layer_hint, q_dq.shape[0])
+    except Exception as e:
+        logger.warning("PIVOT refine dump %d failed: %s", idx, e)
 
 
 def _capturing() -> bool:
@@ -128,6 +299,9 @@ class PivotIndexer:
         if int(cum[-1]) != N:
             # TND row count must match the last cumulative boundary; if not,
             # the caller's grouping is not what we assume -- bail to native.
+            logger.warning_once(
+                "PIVOT: actual_seq_lengths_query[-1]=%d != num_actual_tokens=%d; "
+                "bailing the whole batch to the native indexer.", int(cum[-1]), N)
             return None
 
         counts = _request_counts(cum)  # [R]
@@ -135,6 +309,11 @@ class PivotIndexer:
         if not 2 <= g <= _MAX_GROUP:
             # Not a grouped-decode head (single-token decode, or a prefill
             # leading the batch): nothing to amortize.
+            logger.warning_once(
+                "PIVOT: leading request carries g=%d query rows (not a "
+                "grouped-decode head); bailing the whole batch to the native "
+                "indexer. If this fires in PD co-location, the decode->prefill "
+                "reorder did not put decodes at the batch head.", g)
             return None
 
         # Decode segment: the leading run of requests carrying g query rows.
@@ -150,24 +329,62 @@ class PivotIndexer:
             # (needs prefix caching / chunked prefill to arise): PIVOT's
             # proxy adds nothing there and could approximate past the
             # lossless window, so keep it on the native indexer.
+            logger.warning_once(
+                "PIVOT: uniform batch (g=%d) in attn_state=%s; keeping the "
+                "whole batch on the native indexer.", g,
+                attn_metadata.attn_state)
             return None
 
         device = q_li.device
         N_in = q_li.shape[0]
         q_dq = q_li[:D]  # raw BF16 [D, H, Dh] (no hadamard/quant on this path)
 
-        # ---- 1. mean proxy + 2. coarse screen: K rows -> 4096 ----------
-        # Optionally fused into the npu_indexer_coarse_screen op (Stage-1
-        # group-mean proxy pooling of g query rows + Stage-2 full-prefix
-        # top-4096). Same score formula (sum_h w_bar * relu(q_bar . k)) over
-        # the full [0, L+g) prefix; the SFA attention kernel applies
-        # causality downstream. Off by default (VLLM_ASCEND_PIVOT_COARSE_USE_OP=0)
-        # until it passes its NPU probe; on any op failure we fall back to the
-        # torch reference so the decode path keeps serving.
+        # ---- 1. mean proxy (segment mean over each request's g queries) --
         H, Dh = q_dq.shape[1], q_dq.shape[2]
-        if envs.VLLM_ASCEND_PIVOT_COARSE_USE_OP:
+        q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
+        w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
+
+        # ---- 2. coarse screen: torch proxy scan, K rows -> 4096 ----------
+        # Done in torch (not the native npu_lightning_indexer) so the
+        # candidate superset is _COARSE_BUDGET (4096, the paper's number)
+        # rather than the native 2048 sparse_count hard limit. Same score
+        # formula (sum_h w_bar * relu(q_bar . k)); the SFA attention kernel
+        # applies causality downstream. The proxy domain is [0, L) -- the
+        # paper (Eq. 5) recalls the pool at the group's FIRST position, so
+        # this step's own g tokens never enter the proxy pool (they are the
+        # worst-represented entries of a mean proxy anyway); the local
+        # window below supplies them to the refine domain instead.
+        # Lossless fast path: if every decode request's prefix length
+        # L = seq_lens - g is within _COARSE_BUDGET, the coarse top-4096 over
+        # [0, L) already covers the whole prefix (top-4096 over < 4096
+        # distinct positions is the whole set), so the proxy bmm + topk are
+        # pure overhead -- build the full-prefix candidate set directly.
+        # Ascending (not score-descending) column order is irrelevant
+        # downstream: the refine op re-sorts by score, so the emitted
+        # topk_indices are bit-identical to the coarse-screened path
+        # (candidate set [0, L+g) unchanged).
+        L = seq_lens[:K].to(torch.int64) - g  # [K] per-request prefix length
+        if int(L.max()) <= _COARSE_BUDGET:
+            # Lossless fast path: the coarse top-4096 over [0, L) with L<=4096
+            # is the whole prefix (distinct positions < the budget), so the
+            # proxy bmm + topk are pure overhead -- build the full-prefix
+            # candidate set directly. The local window (2b) stays in torch.
+            col = torch.arange(
+                _COARSE_BUDGET, dtype=torch.int64, device=device)
+            C = torch.where(col[None, :] < L[:, None], col[None, :], -1)
+            window_in_row = False
+        elif (envs.VLLM_ASCEND_PIVOT_COARSE_USE_OP
+                and envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW):
+            # Truncated + op path: npu_indexer_coarse_screen fuses exactly the
+            # torch reference -- Stage-1 group mean pooling (uniform
+            # row_weights == python .mean(dim=1)), the domain-[0, L) coarse
+            # top-4096, then the local-window union/dedup/front-compaction
+            # [L-g+1, L+g) (see 2b) -- and emits the finished candidate row, so
+            # the window is NOT re-applied here. Fall back to the torch
+            # reference on any op failure.
             try:
-                row_weights = torch.ones(K, g, dtype=torch.bfloat16, device=device)
+                row_weights = torch.ones(
+                    K, g, dtype=torch.bfloat16, device=device)
                 C = torch.ops._C_ascend.npu_indexer_coarse_screen(
                     q_dq,
                     kv_cache[2],
@@ -179,23 +396,51 @@ class PivotIndexer:
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=_COARSE_BUDGET,
-                )  # [K, 1, _COARSE_BUDGET] int32, 0-based, -1 padded
-                C = C.view(K, _COARSE_BUDGET)
+                )  # [K, 1, W8] int32; W8 = Align8(_COARSE_BUDGET + 2g - 1)
+                C = C.view(K, -1)
+                aslk_op = (C >= 0).sum(dim=-1).to(torch.int32)
+                logger.info_once(
+                    "PIVOT coarse: using npu_indexer_coarse_screen op "
+                    "(VLLM_ASCEND_PIVOT_COARSE_USE_OP=1).")
             except Exception as e:
-                logger.warning("PIVOT coarse op failed, falling back to torch: %s", e)
-                q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
-                w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
+                logger.warning(
+                    "PIVOT coarse op failed, torch fallback: %s", e)
                 C = _coarse_screen(
                     q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
-                    attn_metadata.block_size, seq_lens[:K],
+                    attn_metadata.block_size, seq_lens[:K] - g,
                 )
+                C, aslk_op = _inject_local_window(C, seq_lens[:K], g)
+            window_in_row = True
         else:
-            q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
-            w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
             C = _coarse_screen(
                 q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
-                attn_metadata.block_size, seq_lens[:K],
+                attn_metadata.block_size, seq_lens[:K] - g,
             )
+            window_in_row = False
+
+        # ---- 2b. per-query local window (paper Appendix B, decode) -------
+        # The paper's decode refine domain is (pool U W_t) per query, with
+        # W_t = [t-W+1, t] and W >= g so the window covers every token
+        # generated within the step. The op's candidate row is shared per
+        # request, so the window enters the row as the GROUP's window union
+        # [L-g+1, L+g) -- deduped against C, appended, C widened, then the
+        # valid candidates are COMPACTED to the row front so the refine op's
+        # S2 walk [0, aslk) reaches the whole refine domain. Entries COMPETE BY
+        # SCORE exactly like pool entries -- the paper's semantics, not a
+        # forced-in reserve slot; each row's causal mask (SFA kernel) trims the
+        # union to that row's own [t-g+1, t]. W = g reproduces the paper's
+        # experimental configuration (w = 4 = g). Skipped when the op already
+        # fused the window into the candidate row (see above).
+        if window_in_row:
+            pass  # aslk_op already set (op/fallback path)
+        elif envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW:
+            C, aslk_op = _inject_local_window(C, seq_lens[:K], g)
+        else:
+            # aslk drives the per-request S2 chunk loop over the CANDIDATE
+            # LIST (row width = C.shape[1]). In the truncated region
+            # L+g > 4096 an unclamped aslk makes the kernel read candidate
+            # columns past the row end (garbage/adjacent rows); clamp.
+            aslk_op = torch.clamp(seq_lens[:K], max=C.shape[1])
 
         # ---- 3. refine: broadcast C, score, top-k -------------------------
         # Query row -> request id within the decode segment (the leading run
@@ -212,18 +457,55 @@ class PivotIndexer:
                 # Op prototype requires candidates DT_INT32; _coarse_screen
                 # returns torch.topk indices (int64). Cast only on the op
                 # path -- the torch reference below consumes C as-is.
+                # aslk_op (computed above = the per-row valid candidate count
+                # after local-window compaction; = L+g in the lossless region,
+                # up to 4096+2g-1 once truncated) bounds the per-request S2
+                # chunk loop over the CANDIDATE LIST; the DUMP persists the
+                # same value the op actually consumed.
                 topk_dec = torch.ops._C_ascend.npu_indexer_refine(
                     q_dq,
                     kv_cache[2],
                     weights[:D],
                     C.to(torch.int32),
                     actual_seq_lengths_query=cum[:K],
-                    actual_seq_lengths_key=seq_lens[:K],
+                    actual_seq_lengths_key=aslk_op,
                     block_table=attn_metadata.block_table[:K],
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=_REFINE_BUDGET,
                 )  # [D, 1, _REFINE_BUDGET] int32
+                # One-shot confirmation that the op path (not the torch
+                # fallback below) is live -- without this a silently failing
+                # op would make gsm8k runs indistinguishable from USE_OP=0.
+                logger.info_once(
+                    "PIVOT refine: using npu_indexer_refine op "
+                    "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
+                # Dump is diagnostics: guarded so a dump bug can never read
+                # "op failed", never trigger the torch fallback, never break
+                # the decode path. _dump_real_inputs self-protects too.
+                _do_dump = False
+                _layer = getattr(sfa_impl, "layer_name", "unknown")
+                if envs.VLLM_ASCEND_PIVOT_REFINE_DUMP:
+                    try:
+                        _do_dump = _dump_gate(_layer)
+                    except Exception as e:
+                        logger.warning_once(
+                            "PIVOT refine dump gate error (%s); skipping dump", e)
+                if _do_dump:
+                    # Dump AFTER the op returned, so the capture holds inputs
+                    # + the op's raw output (pre-gather cols) + the python
+                    # reference output computed from the same tensors.
+                    _dump_real_inputs(
+                        q_dq, weights[:D], C, req_ids, cum[:K], seq_lens[:K],
+                        kv_cache, attn_metadata.block_table[:K],
+                        attn_metadata.block_size,
+                        _layer,
+                        op_topk=topk_dec,
+                        # op 实收的 aslk(=该行有效候选数,经 local-window
+                        # 加宽+compact 后与 raw seq_lens[:K] 分叉),回放必须
+                        # 用这个。
+                        aslk_op=aslk_op,
+                    )
                 # CRITICAL: the refine op's S2 axis is the CANDIDATE LIST, so
                 # it sorts and emits the candidate COLUMN index -- unlike the
                 # native indexer where column == KV position. _coarse_screen
@@ -240,7 +522,7 @@ class PivotIndexer:
                     .to(torch.int32)
                 )
             except Exception as e:
-                logger.warning("PIVOT refine op failed, falling back to torch: %s", e)
+                logger.warning("PIVOT refine op/gather failed, recomputing via torch: %s", e)
                 topk_dec = _refine_topk(
                     q_dq,
                     weights[:D],
@@ -327,7 +609,8 @@ class PivotIndexer:
 
         if _ENABLE_REPORT and not _capturing():
             try:
-                _report(seq_lens[:K], counts[:K], C, topk_indices, D, K, g, R_all, N)
+                _report(seq_lens[:K], counts[:K], C, topk_indices, D, K, g,
+                        R_all, N, aslk=aslk_op)
             except Exception as e:  # diagnostics must never take down the decode path
                 logger.warning("PIVOT[dbg] _report failed: %s", e)
 
@@ -393,11 +676,15 @@ def _coarse_screen(
 
     Replaces the native npu_lightning_indexer proxy scan so the candidate
     superset is _COARSE_BUDGET (4096, the paper's number) rather than the
-    native 2048 sparse_count hard limit. Score formula matches the BF16
-    indexer: score[r, p] = sum_h w_bar[r, h] * relu(q_bar[r, h] . k[r, p])
+    native 2048 sparse_count hard limit. Score formula matches the native
+    fp32 indexer: score[r, p] = sum_h w_bar[r, h] * relu(q_bar[r, h] . k[r, p])
     over p in [0, seq_lens[r]) (= L + g, the full prefix; causality is left
-    to the SFA attention kernel). Returns [R, _COARSE_BUDGET] 0-based
-    positions, -1 padded where the prefix is shorter than the budget.
+    to the SFA attention kernel). NOTE: unlike the native indexer, which
+    scores each query row independently with that row's own q/w, this
+    screen scores a REQUEST-LEVEL mean proxy (q_bar/w_bar averaged over the
+    request's g queries -- the PIVOT paper's design) so each request shares
+    one candidate set. Returns [R, _COARSE_BUDGET] 0-based positions, -1
+    padded where the prefix is shorter than the budget.
     """
     device = q_bar.device
     R = q_bar.shape[0]
@@ -415,8 +702,18 @@ def _coarse_screen(
     slots = block_table[:, pos // block_size] * block_size + pos % block_size
     k_all = kc[slots.reshape(-1)].view(R, L_max, -1)  # [R, L_max, D]
 
-    score = torch.relu(torch.bmm(q_bar, k_all.transpose(1, 2)))  # [R, H, L_max]
-    score = (score * w_bar.unsqueeze(-1)).sum(dim=1)  # [R, L_max]
+    # Score in fp32 (was bf16 via q_bar.dtype): the native indexer is fp32
+    # end to end (Mmad fp32 accumulate -> Fixp NoQuant fp32 writeback), and
+    # at production score magnitude a bf16 score collapses adjacent columns
+    # (gaps of a few hundred) to one bf16 value, distorting the top-4096
+    # candidate set -- same bug class as the old bf16 _refine_topk (see
+    # memory: indexer-refine-tie-root-cause). R is the decode batch request
+    # count (small), so a single bmm is fine memory-wise.
+    q32 = q_bar.to(torch.float32)  # [R, H, Dh]
+    w32 = w_bar.to(torch.float32)  # [R, H]
+    k32 = k_all.to(torch.float32)  # [R, L_max, Dh]
+    score = torch.relu(torch.bmm(q32, k32.transpose(1, 2)))  # [R, H, L_max]
+    score = (score * w32.unsqueeze(-1)).sum(dim=1)  # [R, L_max]
 
     beyond = pos.unsqueeze(0) >= seq_i64.unsqueeze(1)  # [R, L_max]
     score = score.masked_fill(beyond, float("-inf"))
@@ -428,6 +725,113 @@ def _coarse_screen(
     vals, cols = torch.topk(score, _COARSE_BUDGET, dim=-1)  # [R, _COARSE_BUDGET]
     cols = cols.masked_fill(vals == float("-inf"), -1)
     return cols  # [R, _COARSE_BUDGET], 0-based, -1 padded
+
+
+def _inject_local_window(
+    C: torch.Tensor,
+    seq_lens: torch.Tensor,
+    g: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append each request's decode local-window union to its candidate row.
+
+    Paper Appendix B (decode variant): each query refines over (pool U its
+    own W_t = [t-W+1, t]) with duplicates removed, W >= g so the window
+    covers every token generated within the step. The op refines over a
+    SHARED per-request candidate row, so the per-query windows enter the row
+    as their group union [L-g+1, L+g) -- which for W = g is exactly the union
+    of the g queries' windows (query row t's window is [t-g+1, t]; the union
+    over t in [L, L+g) is [L-g+1, L+g)). Each query row still sees its own
+    window in the domain; entries outside the row's causal prefix are
+    masked by the SFA kernel downstream, so the widened union is harmless
+    per row. Entries compete by score in the refine -- the paper's
+    semantics, not a forced-in reserve slot.
+
+    Mechanics. The union is deduplicated against C (the pool is a top-k of
+    positions, so recent ones are already in it) and the genuinely-new
+    entries are appended, widening the row from _COARSE_BUDGET to at most
+    _COARSE_BUDGET + 2g - 1 (the op imposes no candidate-width bound: tiling
+    reads s2Size = candidates.shape[1], workspace scales linearly). The row
+    is then COMPACTED -- valid candidates gathered to the front, -1 pad to
+    the tail. Compaction is required, not cosmetic: the op's S2 walk covers
+    candidate columns [0, aslk) and treats every walked column as a real
+    candidate, so C's own short-prefix -1 padding (columns [valid_C, c))
+    must NOT sit between the coarse prefix and the appended window -- an
+    aslk of L+g would stop at the padding (the window's columns live past c
+    and are never walked: own tokens lost) and an aslk past the padding
+    walks -1 slots. Front-loading makes the whole valid domain reachable.
+
+    Returns (C', aslk'): C' [R, c'] int64 (dtype unchanged) whose valid
+    entries are unique, < L+g, and exactly the columns [0, aslk'[r]) --
+    nothing else. aslk' = the row's valid candidate count (op contract:
+    per-request S2 bound), dtype matching seq_lens. In the lossless region
+    (L + g <= _COARSE_BUDGET) _coarse_screen already returned the whole
+    prefix [0, L) and only the g own tokens are new, so C' holds exactly the
+    whole prefix [0, L+g) with aslk' = L+g -- the same candidate set the
+    native indexer scans -- and refine top-k keeps the lossless contract
+    bit-identically.
+    """
+    device = C.device
+    R, c = C.shape
+    Lg = seq_lens.to(torch.int64)  # [R] = L + g per request
+    L = Lg - g  # [R] prefix length BEFORE this step's own tokens
+    aslk_dtype = seq_lens.dtype
+
+    # Window union [L-g+1, L+g): the g query rows' own windows joined. Query
+    # row t (t in [L, L+g)) attends up to t, so its W_t = [t-g+1, t]; the
+    # union over the group is [L-g+1, L+g). Positions < 0 are dropped via
+    # the `valid` mask below.
+    win = torch.arange(-(g - 1), g, device=device)  # [2g-1]
+    win = L.view(R, 1) + win.view(1, -1)  # [R, 2g-1] absolute positions
+    valid = (win >= 0) & (win < Lg.view(R, 1))
+
+    # Dedup against C: C's valid entries are unique positions, so membership
+    # of each window position in the request's row is an elementwise
+    # broadcast compare + any-reduce -- no sort, no index search. Exactness:
+    # the row's -1 padding never equals a valid (>= 0) window entry, and
+    # `valid` already drops the window's own negative positions, so
+    # `present` is exactly set-membership. (Alternative bitmap membership in
+    # git history; broadcast-compare measured fastest on CPU.)
+    present = (C[:, None, :] == win[:, :, None]).any(dim=2)  # [R, 2g-1]
+    new = valid & ~present  # [R, 2g-1] window entries not already in C
+
+    max_new = int(new.sum(dim=1).max()) if R else 0
+    if max_new == 0:
+        # Nothing to add: the lossless region cannot reach here (the g own
+        # tokens [L, L+g) never enter a [0, L)-domain pool, so every row
+        # adds at least one), so this is the truncated region with the
+        # window already covered by C -- clamp-only aslk over C's compact
+        # rows (valid front, -1 tail) is exact.
+        return C, torch.clamp(seq_lens, max=c)
+
+    # Append the genuinely-new entries in natural ascending position order.
+    # The old key=new<<40 - win descending argsort actually yields ASCENDING
+    # positions (smaller win => larger key => ranked first; verified bitwise
+    # against the live pipeline), and win is ascending by construction -- so
+    # new entries need no sort at all, they write by their running index.
+    W = c + max_new
+    out = C.new_full((R, W), -1)
+    out[:, :c] = C  # C's own valid entries already sit at the row front
+    valid_C = (C >= 0).sum(dim=1)  # [R] C's valid prefix length
+
+    # Compact via a micro-scatter: only the <= 2g-1 new columns per row move.
+    # dst = valid_C + running-new-index is UNIQUE per row (the cumsum over new
+    # entries is 1:1), so every write targets a distinct column -- no duplicate
+    # index writes. The previous version also wrote -1 to the dead pad column
+    # W-1 for non-new columns; when a row's new_count hit max_new, that dead
+    # column coincided with the last new entry's target (win == L+g-1, the
+    # newest own token), producing duplicate-index writes whose order torch's
+    # scatter_ leaves unspecified. On CPU the row-major order happened to let
+    # the last column (always new=True) win, so bitwise tests passed; on NPU
+    # torch_npu the collision is a real race -- the newest own token could be
+    # overwritten with -1 and silently dropped from the refine domain. Writing
+    # ONLY the new entries (out is pre-filled with -1) removes the collision.
+    new_idx = torch.cumsum(new.to(torch.int32), dim=1) - 1  # 0..new_count-1
+    dst = valid_C[:, None] + new_idx  # [R, 2g-1] target column per entry
+    nz_r, nz_c = new.nonzero(as_tuple=True)
+    if nz_r.numel():
+        out[nz_r, dst[nz_r, nz_c]] = win[nz_r, nz_c]
+    aslk_out = (valid_C + new.sum(dim=1)).to(aslk_dtype)  # [R] valid count
+    return out, aslk_out
 
 
 def _refine_topk(
@@ -452,19 +856,19 @@ def _refine_topk(
     """
     device = q_dq.device
     R, c = C.shape
-    D = q_dq.shape[2]
-    k_cache = kv_cache[2]  # [B, S, 1, D] BF16 (PA_BSND)
-    kc = k_cache.view(-1, k_cache.shape[-1])  # [B*S, D]
+    Dh = q_dq.shape[2]  # head_dim (NOT the query row count `D` of select_topk)
+    k_cache = kv_cache[2]  # [B, S, 1, Dh] BF16 (PA_BSND)
+    kc = k_cache.view(-1, k_cache.shape[-1])  # [B*S, Dh]
 
     r = torch.arange(R, dtype=torch.int64, device=device)
     c_safe = C.clamp(min=0).to(torch.int64)  # -1 slots clamped for gather
     slots_c = (
         block_table[r.unsqueeze(1), c_safe // block_size] * block_size + c_safe % block_size
     )  # [R, c]
-    k_cand = kc[slots_c.reshape(-1)].view(R, c, D)  # [R, c, D]
+    k_cand = kc[slots_c.reshape(-1)].view(R, c, Dh)  # [R, c, Dh]
 
     # Broadcast candidates to query rows and score in one bmm per chunk:
-    # [N, H, D] x [N, D, c] -> [N, H, c].
+    # [N, H, Dh] x [N, Dh, c] -> [N, H, c].
     # Score in fp32 (was bf16 via q_dq.dtype). At production score magnitude
     # ~1.9e6 a bf16 buffer's ulp is ~14844 while the adjacent-column gap is a
     # few hundred -> ~56 columns collapse to one bf16 value and the top-k is
@@ -502,13 +906,16 @@ def _report(
     g: int,
     R_all: int,
     N: int,
+    aslk: torch.Tensor | None = None,
 ) -> None:
     """Traceable prints to localize any precision problem on the real op.
 
     Three checks, each narrowing the failure location:
       1. entry shape (segment + whole-batch geometry),
-      2. proxy-scan contract (the coarse screen's per-row valid count vs
-         expected, 4096 wide),
+      2. refine-domain contract (per-row valid candidate count == the aslk the
+         op consumed -- C is post-local-window, so it can legitimately carry
+         up to 2g-1 more columns than _COARSE_BUDGET; the walk bound is the
+         ground truth, not the coarse width) and out-of-range positions,
       3. lossless self-check (decode rows with L+g <= 2048 must reproduce
          the full prefix, i.e. the exact dense key set).
     """
@@ -522,21 +929,27 @@ def _report(
         D, N, K, R_all, g, _COARSE_BUDGET, sl_min, sl_max, counts_list,
     )
 
-    # Proxy-scan contract: valid per-row counts vs expected, out-of-range.
-    # Keep int64 here: NPU max()/clamp() reject int32 (DT_INT32 is not in
-    # aclnnMaxDim's supported list). torch.topk already returns int64, so the
-    # .to() is a defensive no-op.
+    # Refine-domain contract: per-row valid candidate count must equal the
+    # aslk the op consumed (the S2 walk bound), and no candidate position may
+    # reach past its request's L+g. C is post-local-window, so its valid count
+    # can legitimately exceed _COARSE_BUDGET by up to 2g-1 -- the aslk value
+    # is the ground truth. Keep int64: NPU max()/clamp() reject int32.
     C_i64 = C.to(torch.int64)
     valid = C_i64 >= 0
     valid_per_row = valid.sum(-1)  # [K]
-    expected = torch.clamp(seq, max=_COARSE_BUDGET)
-    mismatch = (valid_per_row != expected).sum()
+    if aslk is not None:
+        mismatch = (valid_per_row != aslk.to(torch.int64)).sum()
+        expected_lo = int(aslk.min())
+        expected_hi = int(aslk.max())
+    else:
+        mismatch = -1  # unknown -> report range only
+        expected_lo, expected_hi = -1, -1
     out_of_range = (C_i64.clamp(min=0).max(-1).values >= seq).sum()
     logger.info(
-        "PIVOT[dbg] proxy-scan contract: valid_per_row=[%d..%d] expected=[%d..%d] "
+        "PIVOT[dbg] refine-domain contract: valid_per_row=[%d..%d] aslk=[%d..%d] "
         "mismatch_rows=%d out_of_range_rows=%d",
         int(valid_per_row.min()), int(valid_per_row.max()),
-        int(expected.min()), int(expected.max()),
+        expected_lo, expected_hi,
         int(mismatch), int(out_of_range),
     )
 

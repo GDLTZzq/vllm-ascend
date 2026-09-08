@@ -19,11 +19,12 @@
 namespace vllm_ascend {
 
 at::Tensor construct_indexer_coarse_screen_output_tensor(
-    const at::Tensor& query, const at::Tensor& key,
+    const at::Tensor& query, const at::Tensor& key, const at::Tensor& row_weights,
     const c10::optional<at::Tensor>& actual_seq_lengths_query, int64_t sparse_count,
     const std::string& query_layout_str, const std::string& key_layout_str)
 {
     constexpr int64_t SIZE = 8;
+    constexpr int64_t MAX_GROUP = 16; // 本地窗 group 宽上界(镜像 python _MAX_GROUP)
     constexpr int64_t DIM_0 = 0;
     constexpr int64_t DIM_1 = 1;
     constexpr int64_t DIM_2 = 2;
@@ -44,7 +45,12 @@ at::Tensor construct_indexer_coarse_screen_output_tensor(
     TORCH_CHECK(sparse_count > 0,
                 "sparse count should be greater than 0, but now is ",
                 sparse_count);
-    // coarse_screen 固定 TND query + PA_BSND key: out [R, key.shape[2](恒1), coarseCount]
+    TORCH_CHECK(row_weights.dim() == 2 && row_weights.size(DIM_1) > 0 &&
+                    row_weights.size(DIM_1) <= MAX_GROUP,
+                "row_weights must be rank-2 and its last dim g must be in (0, ",
+                MAX_GROUP, "], but got dim=", row_weights.dim(),
+                " g=", row_weights.dim() > 1 ? row_weights.size(DIM_1) : -1);
+    // coarse_screen 固定 TND query + PA_BSND key: out [R, key.shape[2](恒1), outRowWidth]
     TORCH_CHECK(query_layout_str == "TND",
                 "layout_query only supported TND for coarse_screen, but got ",
                 query_layout_str);
@@ -54,7 +60,10 @@ at::Tensor construct_indexer_coarse_screen_output_tensor(
     TORCH_CHECK(actual_seq_lengths_query.has_value(),
                 "actual_seq_lengths_query must be provided for TND coarse_screen.");
     int64_t batchSize = actual_seq_lengths_query->size(DIM_0);
-    output_size = {batchSize, key.size(DIM_2), sparse_count};
+    // 输出单行宽 = 粗筛 topk 宽 + 本地窗最大新增(自有 g + 尾项去重保留 ≤ g-1) 后 8 对齐
+    int64_t g = row_weights.size(DIM_1);
+    int64_t outRowWidth = (sparse_count + 2 * g - 1 + 7) / 8 * 8;
+    output_size = {batchSize, key.size(DIM_2), outRowWidth};
 
     return at::empty(output_size, query.options().dtype(at::kInt));
 }
@@ -76,7 +85,7 @@ at::Tensor npu_indexer_coarse_screen(
     std::string key_layout_str = std::string(layout_key);
 
     at::Tensor sparse_indices_out = construct_indexer_coarse_screen_output_tensor(
-        query, key, actual_seq_lengths_query, sparse_count, query_layout_str, key_layout_str);
+        query, key, row_weights, actual_seq_lengths_query, sparse_count, query_layout_str, key_layout_str);
 
     char* query_layout_ptr = const_cast<char*>(query_layout_str.c_str());
     char* key_layout_ptr = const_cast<char*>(key_layout_str.c_str());
