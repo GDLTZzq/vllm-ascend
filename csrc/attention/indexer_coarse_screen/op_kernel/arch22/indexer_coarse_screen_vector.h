@@ -1,12 +1,12 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+  */
 
 /*!
  * \file indexer_coarse_screen_vector.h
@@ -244,10 +244,6 @@ __aicore__ inline void SortAll(LocalTensor<float> &src, LocalTensor<float> &tmp,
         AscendC::PipeBarrier<PIPE_V>();
     }
     if (i % CONST_TWO == 0) {
-        // 2026-08-30 修复: DataCopy(MTE2) 写 src 后必须同步到 V 通道。返回后调用方
-        //   (MergeSort 的 MrgSort)立即 V 读 src,仅 PipeBarrier<PIPE_V> 不等 MTE2 →
-        //   mid 4块反复竞态:Sort32 写 tmpSortBuf 覆盖上一轮 DataCopy 未读完的 merge 结果,
-        //   globalTopkUb_ 索引段混入 float 位模式 → col 垃圾(1221019529 实测)。
         AscendC::DataCopy(src, tmp, logitsNum * VALUE_AND_INDEX_NUM);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -293,9 +289,6 @@ __aicore__ inline void MergeSort(const LocalTensor<float> &mrgDst, int32_t mrgDs
         AscendC::MrgSort<float>(tmpTensor, srcList, params);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
-        // 2026-08-30 修复: DataCopy(MTE2) 写 mrgDst 后必须等 MTE2 完成,下一块 MergeSort 的
-        //   MrgSort(V) 立即读 mrgDst(globalTopkUb_)。仅 PIPE_V 不等 MTE2 → 读到旧/半写数据
-        //   → 索引段混入 float 位模式(col 垃圾)。同 SortAll 修复。
         AscendC::PipeBarrier<PIPE_ALL>();
     } else {
         int64_t unitElements = 1024;
@@ -323,7 +316,6 @@ __aicore__ inline void MergeSort(const LocalTensor<float> &mrgDst, int32_t mrgDs
         AscendC::MrgSort<float>(tmpTensor, srcList, params);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
-        // 2026-08-30 修复: 同分支1 — DataCopy 后必须 PIPE_ALL,下一块 MrgSort(V) 读 mrgDst 才安全。
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 }

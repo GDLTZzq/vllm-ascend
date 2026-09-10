@@ -322,7 +322,6 @@ at::Tensor npu_indexer_refine_meta(
 
 at::Tensor npu_indexer_coarse_screen_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
-    const at::Tensor &row_weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
     const c10::optional<at::Tensor> &block_table, c10::string_view layout_query,
@@ -332,36 +331,23 @@ at::Tensor npu_indexer_coarse_screen_meta(
     constexpr int64_t SIZE = 8;
     constexpr int64_t DIM_0 = 0;
     constexpr int64_t DIM_2 = 2;
-    constexpr int64_t G_ALIGN = 8;
-    constexpr int64_t G_ONE = 1;
 
     TORCH_CHECK(query.numel() > 0, "Query is empty.");
     TORCH_CHECK(key.numel() > 0, "Key is empty.");
     TORCH_CHECK(weights.numel() > 0, "Weights is empty.");
-    TORCH_CHECK(row_weights.numel() > 0, "Row_weights is empty.");
     for (size_t i = 0; i < query.sizes().size(); i++) {
         TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
                                        "than 0, but shape[", i, "] is ", query.size(i));
     }
     TORCH_CHECK(sparse_count > 0, "sparse count should be greater than 0, but now is ", sparse_count);
-    // coarse_screen 固定 TND query + PA_BSND key: out [R(aslq 长度), key.shape[2](恒1), outRowWidth]
+    // coarse screen 固定 TND query + PA_BSND key: out [T, key.shape[2](恒1), coarseCount]
     std::string query_layout_str = std::string(layout_query);
     std::string key_layout_str = std::string(layout_key);
     TORCH_CHECK(query_layout_str == "TND",
-                "layout_query only supported TND for coarse_screen, but got ", query_layout_str);
+                "layout_query only supported TND for coarse screen, but got ", query_layout_str);
     TORCH_CHECK(key_layout_str == "PA_BSND",
-                "layout_key only supported PA_BSND for coarse_screen, but got ", key_layout_str);
-    TORCH_CHECK(actual_seq_lengths_query.has_value(),
-                "actual_seq_lengths_query must be provided for TND coarse_screen.");
-    TORCH_CHECK(row_weights.dim() == 2,
-                "row_weights must be rank-2 [K, g], but got dim ", row_weights.dim());
-    int64_t gMax = row_weights.size(DIM_2 - 1);
-    TORCH_CHECK(gMax >= 1 && gMax <= 16,
-                "row_weights.dim1(g) must be in [1,16], but got ", gMax);
-    // outRowWidth = Align8(sparse_count + 2*g - 1)
-    int64_t outRowWidth = ((sparse_count + 2 * gMax - G_ONE + G_ALIGN - G_ONE) / G_ALIGN) * G_ALIGN;
-    at::SmallVector<int64_t, SIZE> output_size = {
-        actual_seq_lengths_query->size(DIM_0), key.size(DIM_2), outRowWidth};
+                "layout_key only supported PA_BSND for coarse screen, but got ", key_layout_str);
+    at::SmallVector<int64_t, SIZE> output_size = {query.size(DIM_0), key.size(DIM_2), sparse_count};
     return at::empty(output_size, query.options().dtype(at::kInt));
 }
 

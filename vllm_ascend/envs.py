@@ -120,9 +120,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # The torch implementation stays as the reference/fallback. Set to "0" to
     # force the torch path (e.g. for P2 gate cross-checks on the NPU box).
     "VLLM_ASCEND_PIVOT_REFINE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_USE_OP", "1"))),
-    # Use the npu_indexer_coarse_screen op (once validated on NPU) instead of
-    # the torch _coarse_screen reference for the PIVOT coarse step. Off by
-    # default until the op passes its NPU probe (P1 gate).
+    # Use the npu_indexer_coarse_screen op instead of the torch
+    # _coarse_screen reference for the PIVOT coarse step. The torch
+    # implementation stays as the reference/fallback. Set to "0" to force the
+    # torch path (e.g. for cross-checks on the NPU box); the op probe lives in
+    # tests/e2e/nightly/single_node/ops/singlecard_ops/test_indexer_coarse_screen.py.
     "VLLM_ASCEND_PIVOT_COARSE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_USE_OP", "0"))),
     # Per-query local window (paper Appendix B, decode variant) in the PIVOT
     # refine DOMAIN: each decode step's pool (proxy top-4096 over [0, L), L =

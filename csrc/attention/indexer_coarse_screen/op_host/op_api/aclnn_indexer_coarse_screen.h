@@ -27,7 +27,6 @@ aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *weights,
-    const aclTensor *rowWeights,
     const aclTensor *actualSeqLengthsQueryOptional,
     const aclTensor *actualSeqLengthsKeyOptional,
     const aclTensor *blockTableOptional,

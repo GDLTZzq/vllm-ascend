@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(echo \"--- exit $? ---\")",
+      "Bash(python *)",
+      "Bash(echo \"=== exit $? \\(1 = clean\\) ===\")",
+      "Bash(ls format.sh)",
+      "Bash(which ruff *)",
+      "Bash(awk 'length>120 {print FILENAME\":\"FNR\" len=\"length}' tests/e2e/nightly/single_node/ops/singlecard_ops/test_indexer_coarse_screen.py)",
+      "Bash(awk 'FNR>=630 && FNR<=670 && length>120 {print FNR\" len=\"length}' vllm_ascend/attention/pivot_indexer.py)",
+      "Bash(awk 'length>120 {print FNR\" len=\"length}' vllm_ascend/envs.py)",
+      "Bash(sed -n '98,108p' csrc/build_aclnn.sh)",
+      "Bash(sed -n '150,158p' csrc/build_aclnn.sh)",
+      "Bash(bash -n csrc/build_aclnn.sh)",
+      "Bash(sed -n '205,240p' setup.py)",
+      "Bash(sed -n '435,450p' setup.py)"
+    ]
+  }
+}

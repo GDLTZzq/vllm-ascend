@@ -1,12 +1,12 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+  */
 
 /*!
  * \file indexer_coarse_screen_kernel.h
@@ -55,10 +55,9 @@ class IndexerCoarseScreenKernel {
 public:
     __aicore__ inline IndexerCoarseScreenKernel(){};
     __aicore__ inline void Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
-                                __gm__ uint8_t *rowWeights, __gm__ uint8_t *actualSeqLengthsQ,
-                                __gm__ uint8_t *actualSeqLengths,
-                                __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices, __gm__ uint8_t *workspace,
-                                const IndexerCoarseScreenTilingData *__restrict tiling, TPipe *tPipe);
+                                __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
+                                __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices,
+                                __gm__ uint8_t *workspace, const IndexerCoarseScreenTilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
 
     // =================================类型定义区=================================
@@ -72,7 +71,7 @@ public:
     // 编译期条件选择模板第二个参数的类型，直接声明W_T
     // 第一个模板参数：固定为Q_T；第二个模板参数：编译期选float/void
     using W_T = typename IndexerCoarseScreenTypeTraits<Q_T,
-                                            typename std::conditional<DT_W_FLAG, float, void>::type>::weightsType;
+                                                typename std::conditional<DT_W_FLAG, float, void>::type>::weightsType;
 
     using MM1_OUT_T = float;
 
@@ -105,18 +104,15 @@ protected:
     uint64_t indiceOutCoreOffset = 0ULL;
 
     // ================================Global Buffer区=================================
-    GlobalTensor<Q_T> queryGm;       // Stage-1 输入 query [N,H,D] TND(池化读);Stage-2 AIC 侧源 = qBarGm
-    GlobalTensor<W_T> weightsGm;     // Stage-1 输入 weights [N,H](池化读)
-    GlobalTensor<W_T> rowWeightsGm;  // Stage-1 输入 row_weights [R,g](池化读)
-    GlobalTensor<Q_T> qBarGm;        // workspace 代理 [K,H,D] bf16
-    GlobalTensor<W_T> wBarGm;        // workspace 代理 [K,H] W_T
+    GlobalTensor<Q_T> queryGm;
+    GlobalTensor<K_T> keyGm;
+    GlobalTensor<W_T> weightsGm;
 
     GlobalTensor<int32_t> indiceOutGm;
     GlobalTensor<int32_t> blockTableGm;
 
     GlobalTensor<uint32_t> actualSeqLengthsGmQ;
     GlobalTensor<uint32_t> actualSeqLengthsGm;
-    GlobalTensor<K_T> paKeyGm;            // 原始 PA key cache(cube 侧全前缀散行直读)
     // workspace
     GlobalTensor<MM1_OUT_T> mm1ResGm;  // 存放S
     GlobalTensor<float> vec1ResGm;     // 存放TopK计算中间结果
@@ -164,13 +160,12 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitTilingData(const Inde
     constInfo.qHeadNum = constInfo.gSize = tilingData->gSize;
     constInfo.kSeqSize = tilingData->s2Size;
     constInfo.qSeqSize = tilingData->s1Size;
-    // coarse 语义:Stage-2 全前缀 topk,无窗口掩码、无 values 输出 → attenMaskFlag/returnValue 恒 false
+    // coarse screen 语义:对 [0, L) 全前缀打分取 top-sparse_count,
+    // 无因果掩码、无 values 输出 → attenMaskFlag/returnValue 恒 false
     constInfo.attenMaskFlag = false;
     constInfo.kCacheBlockSize = tilingData->blockSize;
     constInfo.maxBlockNumPerBatch = tilingData->maxBlockNumPerBatch;
-    constInfo.sparseCount = tilingData->sparseCount; // = coarse_count(输出 topk 宽度,4096)
-    constInfo.gMax = tilingData->gMax;               // 本地窗 group 宽上界 = row_weights.dim1(窗宽 g,窗宽上界)
-    constInfo.outRowWidth = tilingData->outRowWidth; // Align8(sparseCount + 2*gMax - 1), 输出单行宽(有效 + -1 pad)
+    constInfo.sparseCount = tilingData->sparseCount;
     constInfo.preTokens = INT64_MAX;
     constInfo.nextTokens = INT64_MAX;
     constInfo.returnValue = false;
@@ -205,7 +200,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitBuffers()
 
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ,
-                                                            __gm__ uint8_t *actualSeqLengths)
+                                                        __gm__ uint8_t *actualSeqLengths)
 {
     if (actualSeqLengthsQ == nullptr) {
         constInfo.actualLenQDims = 0;
@@ -223,9 +218,9 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitActualSeqLen(__gm__ u
 
 template <typename LIT>
 __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetActualSeqLen(uint32_t bIdx,
-                                                               uint32_t actualLenDims, bool isAccumSeq,
-                                                               GlobalTensor<uint32_t> &actualSeqLengthsGm,
-                                                               uint32_t defaultSeqLen)
+                                                           uint32_t actualLenDims, bool isAccumSeq,
+                                                           GlobalTensor<uint32_t> &actualSeqLengthsGm,
+                                                           uint32_t defaultSeqLen)
 {
     if (actualLenDims == 0) {
         return defaultSeqLen;
@@ -238,28 +233,17 @@ __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetActualSeqLen(uint3
 
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::GetS1S2ActualSeqLen(uint32_t bIdx,
-                                                             uint32_t &actS1Size, uint32_t &actS2Size)
+                                                         uint32_t &actS1Size, uint32_t &actS2Size)
 {
-    // coarse 融合语义(域 [0,L)):每请求 1 行代理(q_bar),S1 恒为 1。
-    // 组宽 g_r = aslq cum 差分(与 PreprocessMean 同取法);L = 自然长度(aslk) − g_r。
-    // S2 = 域长 L(非累加 PA_BSND):cube PA 读、子片数随 L 收缩,自有 token 永不入粗筛。
-    actS1Size = 1;
-    uint32_t seqLen =
+    actS1Size = GetActualSeqLen(bIdx, constInfo.actualLenQDims, constInfo.isAccumSeqS1, actualSeqLengthsGmQ,
+                                constInfo.qSeqSize);
+    actS2Size =
         GetActualSeqLen(bIdx, constInfo.actualLenDims, constInfo.isAccumSeqS2, actualSeqLengthsGm, constInfo.kSeqSize);
-    uint32_t gR = constInfo.gMax;
-    if (constInfo.actualLenQDims != 0) {
-        uint32_t cumPrev = (bIdx == 0) ? 0 : actualSeqLengthsGmQ.GetValue(bIdx - 1);
-        uint32_t cumDiff = actualSeqLengthsGmQ.GetValue(bIdx) - cumPrev;
-        if (cumDiff > 0 && cumDiff < gR) {
-            gR = cumDiff;
-        }
-    }
-    actS2Size = (seqLen > gR) ? (seqLen - gR) : 0;
 }
 
 template <typename LIT>
 __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size,
-                                                                       uint32_t actS2Size)
+                                                                   uint32_t actS2Size)
 {
     if (actS2Size == 0) {
         return 0;
@@ -282,15 +266,15 @@ __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetTotalBaseBlockNum(
         GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size);
         s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
         if (!constInfo.attenMaskFlag) {
-            // 域 [0,L) 下 L 可能为 0(seq_lens==g_r):仍需计 1 块使该请求被某核拥有,
-            // 主流水对 L==0 走 DealActSeqLenIsZero 发窗行,故 over2k 每请求恒 1 块。
-            s2BaseNum = constInfo.isSparseCountOver2K ? 1 : CeilDiv(actS2Size, constInfo.s2BaseSize);
+            s2BaseNum = constInfo.isSparseCountOver2K
+                      ? (actS2Size > 0 ? 1 : 0)
+                      : CeilDiv(actS2Size, constInfo.s2BaseSize);
             totalBlockNum += s1GBaseNum * s2BaseNum * constInfo.kHeadNum;
             continue;
         }
         for (uint32_t s1gIdx = 0; s1gIdx < s1GBaseNum; s1gIdx++) {
             s2BaseNum = constInfo.isSparseCountOver2K
-                      ? 1
+                      ? (actS2Size > 0 ? 1 : 0)
                       : GetS2BaseBlockNumOnMask(s1gIdx, actS1Size, actS2Size);
             totalBlockNum += s2BaseNum * constInfo.kHeadNum;
         }
@@ -301,7 +285,7 @@ __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetTotalBaseBlockNum(
 // 多核版本，双闭区间
 template <typename LIT>
 __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCoreIdx,
-                                                             uint32_t &coreNum, IndexerCoarseScreenCommon::SplitCoreInfo &info)
+                                                         uint32_t &coreNum, IndexerCoarseScreenCommon::SplitCoreInfo &info)
 {
     // 计算每个核最少处理的块数, 剩余的部分前面的核每个核多处理一块
     uint32_t totalBlockNum = GetTotalBaseBlockNum();
@@ -340,8 +324,7 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                 info.s2Start = 0;
                 findLastCoreEnd = false;
             }
-            // over2k 每请求 1 块(L==0 也计 1,交由 DealActSeqLenIsZero 发窗行)
-            s2Loop = constInfo.isSparseCountOver2K ? 1 : s2BaseNum;
+            s2Loop = constInfo.isSparseCountOver2K ? (actS2Size > 0 ? 1 : 0) : s2BaseNum;
             for (uint32_t s2Idx = 0; s2Idx < s2Loop;) {
                 if (findLastCoreEnd) {
                     info.bN2Start = bN2Idx;
@@ -353,9 +336,8 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                 if (lastGS1RemainBlockCnt + s2RemainBaseNum >= coreDealBlockCnt) {
                     info.bN2End = bN2Idx;
                     info.gS1End = gS1Idx;
-                    // L==0 时 s2BaseNum==0,s2End 置 0(主流水短接不消费);正常请求 = 全子片末片
                     info.s2End = constInfo.isSparseCountOver2K
-                               ? (s2BaseNum > 0 ? s2BaseNum - 1 : 0)
+                               ? s2BaseNum - 1
                                : s2Idx + coreDealBlockCnt - lastGS1RemainBlockCnt - 1;
 
                     if (coreIdx == curCoreIdx) {
@@ -390,21 +372,22 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::DealActSeqLenIsZero(uint3
 {
     if ASCEND_IS_AIV {
         if (constInfo.outputLayout == LI_LAYOUT::TND) {
-            // L==0(seq_lens==g_r,域空):输出该请求自有窗行 [0,g_r) 后 -1 pad 至 outRowWidth,
-            // actS1Size 恒为 1 每请求仅 1 行(双 AIV 冗余写同内容,值一致,与旧 CleanInvalidOutput 同构)。
-            for (uint32_t s1Idx = s1Start; s1Idx < tempLoopInfo.actS1Size; s1Idx++) {
+            uint32_t tSize = actualSeqLengthsGmQ.GetValue(constInfo.batchSize - 1);
+            uint32_t tBase = bIdx == 0 ? 0 : actualSeqLengthsGmQ.GetValue(bIdx - 1);
+            uint32_t s1Count = tempLoopInfo.actS1Size;
+
+            for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
                 uint64_t indiceOutOffset =
-                    (uint64_t)bIdx * constInfo.kHeadNum * constInfo.outRowWidth + // B轴(请求)偏移
-                    (uint64_t)n2Idx * constInfo.outRowWidth;                      // N2轴偏移
-                vectorService.WriteZeroRow(bIdx, indiceOutOffset);
+                    (tBase + s1Idx) * constInfo.kHeadNum * constInfo.sparseCount + // T轴、s1轴偏移
+                    n2Idx * constInfo.sparseCount;                                 // N2轴偏移
+                vectorService.CleanInvalidOutput(indiceOutOffset);
             }
         } else if (constInfo.outputLayout == LI_LAYOUT::BSND) {
             for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
                 // B,S1,N2,K
-                uint64_t indiceOutOffset = (uint64_t)bIdx * constInfo.qSeqSize * constInfo.kHeadNum *
-                                               constInfo.outRowWidth +
-                                           (uint64_t)s1Idx * constInfo.kHeadNum * constInfo.outRowWidth + // B轴、S1轴偏移
-                                           (uint64_t)n2Idx * constInfo.outRowWidth; // N2轴偏移
+                uint64_t indiceOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount +
+                                           s1Idx * constInfo.kHeadNum * constInfo.sparseCount + // B轴、S1轴偏移
+                                           n2Idx * constInfo.sparseCount;                       // N2轴偏移
                 vectorService.CleanInvalidOutput(indiceOutOffset);
             }
         }
@@ -413,12 +396,11 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::DealActSeqLenIsZero(uint3
 
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *query,
-                                                __gm__ uint8_t *key, __gm__ uint8_t *weights,
-                                                __gm__ uint8_t *rowWeights,
-                                                __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
-                                                __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices,
-                                                __gm__ uint8_t *workspace, const IndexerCoarseScreenTilingData *__restrict tiling,
-                                                TPipe *tPipe)
+                                            __gm__ uint8_t *key, __gm__ uint8_t *weights,
+                                            __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
+                                            __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices,
+                                            __gm__ uint8_t *workspace, const IndexerCoarseScreenTilingData *__restrict tiling,
+                                            TPipe *tPipe)
 {
     if ASCEND_IS_AIV {
         tmpBlockIdx = GetBlockIdx(); // vec:0-47
@@ -435,10 +417,9 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
     SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
 
     pipe = tPipe;
-    // workspace 内存排布:与生产 lightning_indexer 完全一致
-    // |mm1ResGm(存S)|vec1ResGm(存LD中间结果)|vec1ParamGm(存LD参数)|qBarGm(代理)|wBarGm(代理)
+    // workspace 内存排布
+    // |mm1ResGm(存S)|vec1ResGm(存LD中间结果)|vec1ParamGm(存LD参数)
     // |Core0_mm1ResDB0-Core0_mm1ResDB1-Core1_mm1ResDB0....Core23_mm1ResDB0-Core23_mm1ResDB1|Core0_vec1Res...
-    // |qBarGm[batchSize,gSize,headDim]|wBarGm[batchSize,gSize]| (Stage-1 代理,全局共享,非按核)
     uint64_t offset = 0;
 
     // mm1开DoubleBuffer
@@ -457,31 +438,19 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
     vec1ParamGm.SetGlobalBuffer((__gm__ int64_t *)(workspace + offset));
     offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOUBLE * LD_PARAM_NUM * sizeof(int64_t);
 
-    // Stage-1 组均值代理 workspace(全局共享)
-    qBarGm.SetGlobalBuffer((__gm__ Q_T *)(workspace + offset));
-    offset += constInfo.batchSize * constInfo.gSize * constInfo.headDim * sizeof(Q_T);
-    wBarGm.SetGlobalBuffer((__gm__ W_T *)(workspace + offset));
-    offset += constInfo.batchSize * constInfo.gSize * sizeof(W_T);
-
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tiling);
         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
-        // Stage-1 池化输入(query 原值、逐行 weights、row_weights)
-        queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
         weightsGm.SetGlobalBuffer((__gm__ W_T *)weights);
-        rowWeightsGm.SetGlobalBuffer((__gm__ W_T *)rowWeights);
-        // Stage-2 weights 源 = wBarGm(代理),indiceOut 按请求写 [K,1,sparse_count]
-        vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, vec1ParamGm, wBarGm, indiceOutGm);
-        vectorService.InitPreprocessTensor(queryGm, weightsGm, rowWeightsGm, qBarGm, wBarGm, actualSeqLengthsGmQ);
+        vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, vec1ParamGm, weightsGm, indiceOutGm);
     } else {
         matmulService.InitParams(constInfo);
-        // coarse key 输入 = 原始 PA key cache,cube 侧按全前缀逻辑位置经块表直读散行
-        // Stage-2 query 源 = qBarGm(代理 [K,H,D])
+        queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
         if constexpr (PAGE_ATTENTION) {
             blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
         }
-        paKeyGm.SetGlobalBuffer((__gm__ K_T *)key);
-        matmulService.InitMm1GlobalTensor(blockTableGm, paKeyGm, qBarGm, mm1ResGm);
+        keyGm.SetGlobalBuffer((__gm__ K_T *)key);
+        matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm, mm1ResGm);
     }
     InitBuffers();
 }
@@ -542,7 +511,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcGS1LoopParams(uint32_
 
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop,
-                                                             uint32_t s2LoopIdx, IndexerCoarseScreenCommon::RunInfo &runInfo)
+                                                         uint32_t s2LoopIdx, IndexerCoarseScreenCommon::RunInfo &runInfo)
 {
     runInfo.loop = loop;
     runInfo.bIdx = tempLoopInfo.bIdx;
@@ -579,14 +548,14 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
         }
         uint64_t tndBIdxOffset = actualSeqQPrefixSum * constInfo.qHeadNum * constInfo.headDim;
         uint64_t tndKeyBIdxOffset = actualSeqKPrefixSum * constInfo.kHeadNum * constInfo.headDim;
-        // coarse 语义:Stage-2 源 = 代理 workspace(qBarGm/wBarGm),按请求 bIdx 索引
-        queryCoreOffset = runInfo.bIdx * constInfo.qHeadNum * constInfo.headDim;
+        // B,S1,N1(N2,G),D
+        queryCoreOffset = tndBIdxOffset + runInfo.gS1Idx * constInfo.mBaseSize * constInfo.headDim;
         keyCoreOffset = tndKeyBIdxOffset + runInfo.n2Idx * constInfo.headDim;
-        // B,S1,N1(N2,G)
-        weightsCoreOffset = runInfo.bIdx * constInfo.qHeadNum;
-        // B,S1,N2,W8(行宽 = 8 对齐 outRowWidth,含有效 + -1 pad)
-        indiceOutCoreOffset = (uint64_t)runInfo.bIdx * constInfo.kHeadNum * constInfo.outRowWidth +
-                              (uint64_t)runInfo.n2Idx * constInfo.outRowWidth;
+        // B,S1,N1(N2,G)/T,N1(N2,G)
+        weightsCoreOffset = actualSeqQPrefixSum * constInfo.qHeadNum + runInfo.n2Idx * constInfo.gSize;
+        // B,S1,N2,k/T,N2,k
+        indiceOutCoreOffset = actualSeqQPrefixSum * constInfo.kHeadNum * constInfo.sparseCount +
+                              runInfo.n2Idx * constInfo.sparseCount;
     }
     runInfo.tensorQueryOffset = queryCoreOffset;
     runInfo.tensorKeyOffset = keyCoreOffset + runInfo.s2Idx * constInfo.s2BaseSize * constInfo.kHeadNum
@@ -612,9 +581,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
 {
     if ASCEND_IS_AIV {
         uint32_t aivCoreNum = GetBlockNum() * 2; // 2 means c:v = 1:2
-        // coarse 语义:输出 [K,1,outRowWidth],每请求仅 1 行
         uint64_t totalOutputSize =
-            constInfo.batchSize * constInfo.kHeadNum * constInfo.outRowWidth;
+            constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount;
         uint64_t singleCoreSize =
             IndexerCoarseScreenCommon::Align((totalOutputSize + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(OUT_T));
         uint64_t baseSize = tmpBlockIdx * singleCoreSize;
@@ -631,17 +599,11 @@ template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
 {
     if (aiCoreIdx >= usedCoreNum) {
-        // 无任务核直接返回(同 lightning_indexer:任务检查最先,无任务核不参与任何同步)
+        // 无任务核直接返回
         return;
     }
 
     if ASCEND_IS_AIV {
-        // coarse 两段式编排:
-        // Stage-1 组均值代理:本核对配对 AIC 的整个 b 区间 [bN2Start,bN2End] 逐请求
-        // 池化出 q_bar/w_bar 写 workspace,完成后 PipeBarrier<PIPE_ALL>。
-        // 再预置 syncV1C1×2 种子 flag(MTE2),既保证配对 AIC 首两轮 matmul 等到
-        // 代理数据就绪,又供 AIC 尾部两轮 CrossCoreWaitFlag 收束(与生产 lightning_indexer 一致)。
-        vectorService.PreprocessMean(splitCoreInfo.bN2Start, splitCoreInfo.bN2End);
         vectorService.AllocEventID();
         CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
         CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
@@ -682,7 +644,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
 
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessBaseBlock(uint32_t loop,
-                                                             uint64_t s2LoopIdx, IndexerCoarseScreenCommon::RunInfo &runInfo)
+                                                         uint64_t s2LoopIdx, IndexerCoarseScreenCommon::RunInfo &runInfo)
 {
     CalcRunInfo(loop, s2LoopIdx, runInfo);
     if ASCEND_IS_AIC {

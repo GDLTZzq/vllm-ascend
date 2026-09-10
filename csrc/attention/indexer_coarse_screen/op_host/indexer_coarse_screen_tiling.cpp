@@ -1,12 +1,12 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 /*!
  * \file indexer_coarse_screen_tiling.cpp
@@ -35,10 +35,6 @@ ge::graphStatus IndexerCoarseScreenInfoParser::CheckRequiredInOutExistence() con
     OP_CHECK_IF(opParamInfo_.weights.shape == nullptr, OP_LOGE(opName_, "Shape of tensor value is nullptr"),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.weights.desc == nullptr, OP_LOGE(opName_, "Desc of tensor value is nullptr"),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.rowWeights.shape == nullptr, OP_LOGE(opName_, "Shape of tensor row_weights is nullptr"),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.rowWeights.desc == nullptr, OP_LOGE(opName_, "Desc of tensor row_weights is nullptr"),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.attenOut.shape == nullptr, OP_LOGE(opName_, "Shape of tensor output is nullptr"),
                return ge::GRAPH_FAILED);
@@ -125,8 +121,6 @@ void IndexerCoarseScreenInfoParser::GetInputParaInfo()
     opParamInfo_.key.shape = context_->GetInputShape(KEY_INDEX);
     opParamInfo_.weights.desc = context_->GetInputDesc(WEIGTHS_INDEX);
     opParamInfo_.weights.shape = context_->GetInputShape(WEIGTHS_INDEX);
-    opParamInfo_.rowWeights.desc = context_->GetInputDesc(ROW_WEIGHTS_INDEX);
-    opParamInfo_.rowWeights.shape = context_->GetInputShape(ROW_WEIGHTS_INDEX);
     GetOptionalInputParaInfo();
 }
 
@@ -155,24 +149,15 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
         OP_LOGI(context_->GetNodeName(), "coarse count is:%d", *opParamInfo_.sparseCount);
     }
     OP_LOGI(context_->GetNodeName(), "GetAndCheckAttrParaInfo end");
-    // coarse_screen 固定 query=TND(连续总行), key=PA_BSND(从 PA cache 全前缀 gather)
+    // coarse screen 固定 query=TND(连续总行), key=PA_BSND
     OP_CHECK_IF((std::string(opParamInfo_.layOut) != "TND"),
-               OP_LOGE(opName_, "input attr layout_query only supported TND for coarse_screen."),
+               OP_LOGE(opName_, "input attr layout_query only supported TND for coarse screen."),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF((std::string(opParamInfo_.layOutKey) != "PA_BSND"),
-               OP_LOGE(opName_, "input attr layout_key only supported PA_BSND for coarse_screen."),
+               OP_LOGE(opName_, "input attr layout_key only supported PA_BSND for coarse screen."),
                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(!((*opParamInfo_.sparseCount > 0) && (*opParamInfo_.sparseCount <= SPARSE_LIMIT)),
-               OP_LOGE(opName_, "input attr sparse_count must > 0 and <= 8192."),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(((*opParamInfo_.sparseCount > 2048) && (*opParamInfo_.sparseCount % 1024 != 0)),
-               OP_LOGE(opName_, "when sparse_count > 2048, sparse_count must be an integer multiple of 1024."),
-               return ge::GRAPH_FAILED);
-    // PIVOT 本地窗融合路径: 粗筛 topk 宽固定 = COARSE_COUNT(4096), 输出单行宽按 W8 语义(见
-    // ValidateInputShapesMatch), 需单 block 内全前缀累加的 2k 拓扑, 其它取值不支持融合窗输出.
-    OP_CHECK_IF((*opParamInfo_.sparseCount != static_cast<int32_t>(COARSE_COUNT)),
-               OP_LOGE(opName_, "PIVOT fused coarse_screen: attr sparse_count must be exactly %u.",
-                   COARSE_COUNT),
+    OP_CHECK_IF(*opParamInfo_.sparseCount != static_cast<int32_t>(COARSE_COUNT),
+               OP_LOGE(opName_, "input attr sparse_count must be %u.", COARSE_COUNT),
                return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
@@ -201,10 +186,6 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckInOutDataType()
             return ge::GRAPH_FAILED);
     OP_CHECK_IF(((inputQType_ != ge::DT_FLOAT16) && (inputQType_ != ge::DT_BF16)),
                OP_LOGE(opName_, "The data types of the input query, key must be float16 or bfloat16."),
-               return ge::GRAPH_FAILED);
-    ge::DataType rowWeightsType = opParamInfo_.rowWeights.desc->GetDataType();
-    OP_CHECK_IF(((rowWeightsType != ge::DT_FLOAT16) && (rowWeightsType != ge::DT_BF16)),
-               OP_LOGE(opName_, "The data type of the input row_weights must be float16 or bfloat16."),
                return ge::GRAPH_FAILED);
     if (socVersion_ == platform_ascendc::SocVersion::ASCEND950) {
         OP_CHECK_IF((inputQType_ != weightsType_),
@@ -291,7 +272,7 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckOptionalInput()
 ge::graphStatus IndexerCoarseScreenInfoParser::CheckShapeDim()
 {
     // 固定组合: query=TND [T,H,D], key=PA_BSND [BlockNum,BlockSize,1,D], weights [T,H],
-    //           row_weights [R,g], out [R,1,coarseCount], block_table [R,maxBlockNumPerBatch]
+    //           out [T,1,coarseCount], block_table [R,maxBlockNumPerBatch]
     OP_CHECK_IF((opParamInfo_.blockTable.tensor != nullptr) &&
                    (opParamInfo_.blockTable.tensor->GetStorageShape().GetDimNum() != DIM_NUM_TWO),
                OP_LOGE(opName_, "the dim num of block_table's shape should be 2"), return ge::GRAPH_FAILED);
@@ -300,7 +281,6 @@ ge::graphStatus IndexerCoarseScreenInfoParser::CheckShapeDim()
     uint32_t qShapeDim = opParamInfo_.query.shape->GetStorageShape().GetDimNum();
     uint32_t weightsShapeDim = opParamInfo_.weights.shape->GetStorageShape().GetDimNum();
     uint32_t outShapeDim = opParamInfo_.attenOut.shape->GetStorageShape().GetDimNum();
-    uint32_t rowWeightsShapeDim = opParamInfo_.rowWeights.shape->GetStorageShape().GetDimNum();
     OP_CHECK_IF(kShapeDim != DIM_NUM_FOUR,
                OP_LOGE(opName_, "the dim num of key's shape should be %u, but now is %u", DIM_NUM_FOUR, kShapeDim),
                return ge::GRAPH_FAILED);
@@ -315,10 +295,6 @@ ge::graphStatus IndexerCoarseScreenInfoParser::CheckShapeDim()
     OP_CHECK_IF(!(weightsShapeDim == DIM_NUM_TWO),
                OP_LOGE(opName_, "the dim num of weights's shape should be %u, but now is %u", DIM_NUM_TWO,
                 weightsShapeDim),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(rowWeightsShapeDim != DIM_NUM_TWO,
-               OP_LOGE(opName_, "the dim num of row_weights's shape should be %u, but now is %u", DIM_NUM_TWO,
-                rowWeightsShapeDim),
                return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
@@ -448,56 +424,49 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetS2SizeForPageAttention()
         return ge::GRAPH_FAILED;
     }
     maxBlockNumPerBatch_ = opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(1);
-    // coarse_screen 的 s2Size = 全前缀上界 = block_table 宽 * blockSize,非候选集宽度
+    // s2Size = PA key cache 可容纳的总 token 数(块表宽 × 块大小),与 lightning_indexer 同式
     s2Size_ = static_cast<int64_t>(maxBlockNumPerBatch_) * blockSize_;
-    OP_LOGI(context_->GetNodeName(), "maxBlockNumPerBatch_ is %d, blockSize_ is %d, s2Size_(prefix bound) is %d",
+    OP_LOGI(context_->GetNodeName(), "maxBlockNumPerBatch_ is %d, blockSize_ is %d, s2Size_ is %d",
               maxBlockNumPerBatch_, blockSize_, static_cast<int32_t>(s2Size_));
     return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus IndexerCoarseScreenInfoParser::GetS2Size()
 {
-    // coarse_screen 的 key 恒为 PA_BSND, s2Size = 全前缀上界(见 GetS2SizeForPageAttention)
+    // coarse screen 的 key 恒为 PA_BSND, s2Size = 块表宽 × 块大小(见 GetS2SizeForPageAttention)
     if (kLayout_ == DataLayout::BnBsND) {
         return GetS2SizeForPageAttention();
     }
-    OP_LOGE(opName_, "input attr layout_key only supported PA_BSND for coarse_screen.");
+    OP_LOGE(opName_, "input attr layout_key only supported PA_BSND for coarse screen.");
     return ge::GRAPH_FAILED;
 }
 
 ge::graphStatus IndexerCoarseScreenInfoParser::ValidateInputShapesMatch()
 {
     /*
-    coarse_screen 固定 TND query + PA_BSND key:
+    coarse screen 固定 TND query + PA_BSND key:
     query [T,H,D],
     key [BlockNum,BlockSize,1,D],
     weight [T,H],
-    row_weights [R,g],
     block_table [R, BatchMaxBlockNum],
-    act_seq_q [R], act_seq_k [R],
-    out [R,1,coarseCount]
+    act_seq_k [R], act_seq_q [R],
+    out [T,1,coarseCount]
     */
     // -----------------------check BatchSize(R)-------------------
-    OP_CHECK_IF((opParamInfo_.actualSeqLengthsQ.tensor->GetShapeSize() != bSize_) ||
-                (opParamInfo_.actualSeqLengths.tensor->GetShapeSize() != bSize_) ||
-                (opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0) != bSize_) ||
-                (opParamInfo_.attenOut.shape->GetStorageShape().GetDim(0) != bSize_) ||
-                (opParamInfo_.rowWeights.shape->GetStorageShape().GetDim(0) != bSize_),
+    OP_CHECK_IF((opParamInfo_.actualSeqLengths.tensor->GetShapeSize() != bSize_) ||
+                (opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0) != bSize_),
                 OP_LOGE(opName_,
-                    "TND case input actual_seq_lengths_query, actual_seq_lengths_key, block_table dim 0, "
-                    "sparse_indices dim 0, row_weights dim 0 are %ld, %ld, %ld, %ld, %ld respectively, "
-                    "they must be same as batchSize %u.",
-                    opParamInfo_.actualSeqLengthsQ.tensor->GetShapeSize(),
+                    "TND case input actual_seq_lengths_key, block_table dim 0 are %ld, %ld respectively, they must be same as batchSize %u.",
                     opParamInfo_.actualSeqLengths.tensor->GetShapeSize(),
-                    opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0),
-                    opParamInfo_.attenOut.shape->GetStorageShape().GetDim(0),
-                    opParamInfo_.rowWeights.shape->GetStorageShape().GetDim(0), bSize_),
+                    opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0), bSize_),
                 return ge::GRAPH_FAILED);
-    // -----------------------check T(query 总行)-------------------
+    // -----------------------check T-------------------
     uint32_t qTsize = opParamInfo_.query.shape->GetStorageShape().GetDim(0);
-    OP_CHECK_IF((opParamInfo_.weights.shape->GetStorageShape().GetDim(0) != qTsize),
-                OP_LOGE(opName_, "TND case input query, weights dim 0 are %u, %ld respectively, they must be same.",
-                    qTsize, opParamInfo_.weights.shape->GetStorageShape().GetDim(0)),
+    OP_CHECK_IF((opParamInfo_.weights.shape->GetStorageShape().GetDim(0) != qTsize) ||
+                (opParamInfo_.attenOut.shape->GetStorageShape().GetDim(0) != qTsize),
+                OP_LOGE(opName_, "TND case input query, weights and sparse_indices dim 0 are %u, %ld, %ld respectively, they must be same.",
+                    qTsize, opParamInfo_.weights.shape->GetStorageShape().GetDim(0),
+                    opParamInfo_.attenOut.shape->GetStorageShape().GetDim(0)),
                 return ge::GRAPH_FAILED);
     // -----------------------check N1(H)-------------------
     OP_CHECK_IF((opParamInfo_.weights.shape->GetStorageShape().GetDim(DIM_IDX_ONE) != n1Size_),
@@ -511,20 +480,10 @@ ge::graphStatus IndexerCoarseScreenInfoParser::ValidateInputShapesMatch()
                        "but now they are %u, %ld respectively.",
                        n2Size_, opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_ONE)),
                return ge::GRAPH_FAILED);
-    // -----------------------check row_weights 宽(g ∈ [1,16])并求 gMax/outRowWidth-------------------
-    gMax_ = static_cast<uint32_t>(opParamInfo_.rowWeights.shape->GetStorageShape().GetDim(DIM_IDX_ONE));
-    OP_CHECK_IF(((gMax_ == 0) || (gMax_ > MAX_GROUP)),
-               OP_LOGE(opName_, "row_weights shape last dim(g) must be in [1, %u], but now is %u.",
-                   MAX_GROUP, gMax_),
-               return ge::GRAPH_FAILED);
-    sparseCount_ = static_cast<uint32_t>(*opParamInfo_.sparseCount);
-    // 输出单行宽 = 粗筛 topk 宽 + 本地窗最大新增(自有 g + 尾项去重后保留 ≤ g-1) 后 8 对齐
-    outRowWidth_ = AlignUpTo8(sparseCount_ + 2 * gMax_ - 1);
-    // -----------------------check 输出单行宽(恒 = outRowWidth)-------------------
-    OP_CHECK_IF((opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO) != outRowWidth_),
-               OP_LOGE(opName_,
-                   "output sparse_indices shape last dim must be same as outRowWidth(Align8(sparse_count + 2*g - 1)),"
-                       "but now they are %u, %ld respectively.", outRowWidth_,
+    // -----------------------check coarseCount(输出 topk 宽)-------------------
+    OP_CHECK_IF((opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO) != *opParamInfo_.sparseCount),
+               OP_LOGE(opName_, "output sparse_indices shape last dim must be same as attr sparse_count,"
+                       "but now they are %u, %ld respectively.", static_cast<uint32_t>(*opParamInfo_.sparseCount),
                        opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO)),
                return ge::GRAPH_FAILED);
 
@@ -540,7 +499,7 @@ void IndexerCoarseScreenInfoParser::GenerateInfo(IndexerCoarseScreenTilingInfo &
 
     liInfo.bSize = bSize_;
     liInfo.s1Size = s1Size_;
-    liInfo.s2Size = s2Size_; // 全前缀上界
+    liInfo.s2Size = s2Size_; // PA key cache 总 token 容量
     liInfo.gSize = gSize_;   // H
 
     liInfo.inputQType = inputQType_;
@@ -554,8 +513,6 @@ void IndexerCoarseScreenInfoParser::GenerateInfo(IndexerCoarseScreenTilingInfo &
     std::string layOutKeyStr(opParamInfo_.layOutKey);
     liInfo.pageAttentionFlag = layOutKeyStr == "PA_BSND" ? true : false;
     liInfo.sparseCount = *opParamInfo_.sparseCount; // coarseCount
-    liInfo.gMax = gMax_;
-    liInfo.outRowWidth = outRowWidth_;
 
     liInfo.inputQLayout = qLayout_;
     liInfo.inputKLayout = kLayout_;
@@ -637,25 +594,17 @@ ge::graphStatus IndexerCoarseScreenTiling::DoTiling(IndexerCoarseScreenTilingInf
         workspaceSize +=
             V1_DECODE_DATA_NUM * S1_BASE_SIZE * V1_DECODE_PARAM_NUM * V1_DECODE_PARAM_ELEM_SIZE * aicNum;
     }
-    // coarse_screen 特有: 组均值代理 workspace(AIV 池化写,AIC mm 读,全局共享)
-    //   qBarGm [bSize*gSize*headDim] bf16(每请求 1 行 q_bar)
-    //   wBarGm [bSize*gSize] bf16(每请求 1 行 w_bar)
-    workspaceSize += static_cast<uint64_t>(tilingInfo->bSize) * tilingInfo->gSize * HEAD_DIM_LIMIT *
-                     sizeof(uint16_t); // qBarGm
-    workspaceSize += static_cast<uint64_t>(tilingInfo->bSize) * tilingInfo->gSize * sizeof(uint16_t); // wBarGm
     size_t *workSpaces = context_->GetWorkspaceSizes(1);
     workSpaces[0] = static_cast<size_t>(workspaceSize);
 
     // -------------set tilingdata-----------------
     tilingData_.set_bSize(tilingInfo->bSize);
-    tilingData_.set_s2Size(tilingInfo->s2Size); // 全前缀上界
+    tilingData_.set_s2Size(tilingInfo->s2Size); // PA key cache 总 token 容量
     tilingData_.set_s1Size(tilingInfo->s1Size);
     tilingData_.set_sparseCount(tilingInfo->sparseCount); // coarseCount
     tilingData_.set_gSize(tilingInfo->gSize);
     tilingData_.set_blockSize(tilingInfo->blockSize);
     tilingData_.set_maxBlockNumPerBatch(tilingInfo->maxBlockNumPerBatch);
-    tilingData_.set_gMax(tilingInfo->gMax);
-    tilingData_.set_outRowWidth(tilingInfo->outRowWidth);
     tilingData_.set_usedCoreNum(blockDim);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
