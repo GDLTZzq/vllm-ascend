@@ -451,11 +451,13 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::PreprocessMean(uin
         if (totalW == 0.0f) {
             totalW = 1.0f;
         }
-        AscendC::Duplicate(invUb, 1.0f, 1);
+        // VEC 操作数须 32B 对齐:原 invUb[1] 落在 516B(非对齐)会触发
+        // "UB address accessed by the VEC instruction is not aligned"。借用 qAccUb
+        // 作 totalW 的对齐暂存(下方 h 循环首行才重新 Duplicate,此间未用)。
+        AscendC::Duplicate(invUb, 1.0f, 8);
+        AscendC::Duplicate(qAccUb, totalW, 8);
         AscendC::PipeBarrier<PIPE_V>();
-        LocalTensor<float> totalWUb = invUb[1];
-        totalWUb.SetValue(0, totalW);
-        AscendC::Div(invUb, invUb, totalWUb, 1);
+        AscendC::Div(invUb, invUb, qAccUb, 8);
         AscendC::PipeBarrier<PIPE_V>();
         float invW = invUb.GetValue(0);
 
