@@ -101,6 +101,13 @@ def run(op, L, g=4, h=8):
             f" perm={perm} rankdev={rank_dev}"
     print(f"L={L:5d} seq={seq:5d} n={n:5d} c={c:5d} desc_viol={desc_viol:5d} "
           f"first={first_bad:5d}->blk{first_bad // CHUNK if first_bad >= 0 else -1}{extra} {tag}")
+    # structural dump: source domain-chunk (coarse[i]//512) sampled every 64
+    # output positions -> reveals the output permutation at a glance.
+    cm = [coarse[i] // CHUNK for i in range(0, c, 64)]
+    print(f"   srcchunk@pos/64: {cm}")
+    print(f"   head={coarse[:16]} tail={coarse[-16:]}")
+    if c <= 640:
+        print(f"   full={coarse}")
     if desc_viol:
         print(f"   viol_by_out_blk={dict(sorted(buckets.items()))}")
         j = first_bad
