@@ -1,118 +1,379 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/logos/vllm-ascend-logo-text-dark.png">
-    <img alt="vllm-ascend" src="https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/logos/vllm-ascend-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# fused_li_manage_mtp
 
-<h3 align="center">
-vLLM Ascend Plugin
-</h3>
+这是标准化 `fused_li_manage_mtp` 的独立开发与调优工程。算子支持每请求
+1–14 路 query（MTP0–MTP13），并在一次 NPU 调用中融合 Lightning Indexer
+TopK、首次 resident 建表、卸载稳态 hit/miss、淘汰、搬运列表生成和持久化
+pool 更新。
 
-<div align="center">
+- 完整接口、状态机和约束：
+  [`FUSED_LI_MANAGE_MTP_INTERFACE.md`](FUSED_LI_MANAGE_MTP_INTERFACE.md)
+- 历史与当前性能结果：
+  [`FUSED_LI_MANAGE_MTP_PERFORMANCE.md`](FUSED_LI_MANAGE_MTP_PERFORMANCE.md)
 
-[![DeepWiki](https://img.shields.io/badge/DeepWiki-Ask_AI-_.svg?style=flat&color=0052D9&labelColor=000000&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==)](https://deepwiki.com/vllm-project/vllm-ascend)
+## 关键规格
 
-</div>
+- Q 范围：`1..14`，对应 MTP0–MTP13。
+- 状态：`-3` 非卸载、`-2` 首次卸载、`-1` 卸载稳态；同一 batch 可混合 Q
+  和状态。
+- cache budget：`C <= 32640`（32767 以下最大的 128 倍数），并受逐请求
+  `Q`、`L` 动态约束。
+- source capacity：最大 `2^21 = 2,097,152`。
+- 内部 payload：`[slot15 | source_low17]`；长序列用 FP32 排序 key 低 4 bit
+  携带 `source_high4`。
+- `miss_src_ids/miss_dst_slots`：`int32[B,32768]`，仅前
+  `miss_counts[b]` 项有效。
 
-<p align="center">
-| <a href="https://www.hiascend.com/en/"><b>About Ascend</b></a> | <a href="https://docs.vllm.ai/projects/ascend/en/latest/"><b>Documentation</b></a> | <a href="https://slack.vllm.ai"><b>#SIG-Ascend</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/vllm-ascend-support"><b>Users Forum</b></a> | <a href="https://tinyurl.com/vllm-ascend-meeting"><b>Weekly Meeting</b></a> |
-</p>
+## 算子接口
 
-<p align="center">
-<a ><b>English</b></a> | <a href="README.zh.md"><b>中文</b></a>
-</p>
+```python
+torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
+    index_weights,                 # bf16/fp16 [T, N]
+    query_dequant_scale,           # fp32 [T, N]
+    query,                         # bf16/fp16 [T, N, 128]
+    index_key_dequant_scale,       # fp32 [INDEX_BLOCKS, 128, 1]
+    index_key_cache,               # bf16/fp16 [INDEX_BLOCKS, 128, 1, 128]
+    index_block_table,             # int32 [B, INDEX_MAX_BLOCKS]
+    actual_seq_lengths_query,      # int32 [B]，累计 query 结束位置
+    actual_seq_lengths_key,        # int32 [B]
+    offload_seq_lengths_key,       # int32 [B]，稳定 source prefix L
+    num_cache_tokens,              # int32 [B]，cache budget C
+    request_state,                 # int32 [B]，仅允许 -3/-2/-1
+    req_pool_entries,              # int32 [B]
+    cache_slots_pool,              # int32 [POOL_SIZE, SOURCE_CAPACITY]，原地更新
+    topk_src_ids,                  # int32 [T, 1, 2048]，输出
+    topk_dst_slots,                # int32 [T, 1, 2048]，输出
+    topk_miss_counts,              # int32 [T]，输出
+    miss_src_ids,                  # int32 [B, 32768]，输出
+    miss_dst_slots,                # int32 [B, 32768]，输出
+    miss_counts,                   # int32 [B]，输出
+) -> None
+```
 
----
-*Latest News* 🔥
+其中 `T = sum(Q_i)`，每请求 `1 <= Q_i <= 14`，`N` 只能为 32 或 64；
+`query/index_weights/index_key_cache` 必须具有相同的 BF16 或 FP16 dtype。算子没有
+返回 tensor，pool 和全部输出均由调用方预分配并原地写入。`miss_src_ids` 与
+`miss_dst_slots` 必须使用新的 `[B,32768]` ABI，旧 `[B,16384]` shape 会被明确拒绝。
 
-- [2026/07] We released the new official version [v0.23.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0/) to start using vLLM Ascend Plugin on Ascend.
-- [2026/05] We released the new official version [v0.18.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.18.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.18.0/) to start using vLLM Ascend Plugin on Ascend.
-- [2026/02] We released the new official version [v0.13.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.13.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.13.0/) to start using vLLM Ascend Plugin on Ascend.
+状态语义：`-3` 执行非卸载 LI 并恢复 identity pool；`-2` 忽略旧映射并首次建立
+包含 C 个 resident token 的 sparse pool；`-1` 在已有 sparse pool 上执行稳态
+hit/miss、淘汰和搬运列表生成。完整逐 tensor 语义、因果长度和动态约束见
+[`FUSED_LI_MANAGE_MTP_INTERFACE.md`](FUSED_LI_MANAGE_MTP_INTERFACE.md)。
 
-<details>
-<summary>More</summary>
+## 环境与编译
 
-- [2025/12] We released the new official version [v0.11.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.11.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.11.0/) to start using vLLM Ascend Plugin on Ascend.
-- [2025/09] We released the new official version [v0.9.1](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.9.1)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.9.1/tutorials/large_scale_ep.html) to start deploying large-scale Expert Parallelism (EP) on Ascend.
-- [2025/08] We hosted the [vLLM Beijing Meetup](https://mp.weixin.qq.com/s/7n8OYNrCC_I9SJaybHA_-Q) with vLLM and Tencent! Please find the [meetup slides](https://drive.google.com/drive/folders/1Pid6NSFLU43DZRi0EaTcPgXsAzDvbBqF).
-- [2025/06] [User stories](https://docs.vllm.ai/projects/ascend/en/latest/community/user_stories/index.html) page is now live! It kicks off with LLaMA-Factory/verl/TRL/GPUStack to demonstrate how vLLM Ascend assists Ascend users in enhancing their experience across fine-tuning, evaluation, reinforcement learning (RL), and deployment scenarios.
-- [2025/06] [Contributors](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html) page is now live! All contributions deserve to be recorded, thanks for all contributors.
-- [2025/05] We've released the first official version [v0.7.3](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.7.3)! We collaborated with the vLLM community to publish a blog post sharing our practice: [Introducing vLLM Hardware Plugin, Best Practice from Ascend NPU](https://blog.vllm.ai/2025/05/12/hardware-plugin.html).
-- [2025/03] We hosted the [vLLM Beijing Meetup](https://mp.weixin.qq.com/s/VtxO9WXa5fC-mKqlxNUJUQ) with vLLM team! Please find the [meetup slides](https://drive.google.com/drive/folders/1Pid6NSFLU43DZRi0EaTcPgXsAzDvbBqF).
-- [2025/02] vLLM community officially created [vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend) repo for running vLLM seamlessly on the Ascend NPU.
-- [2024/12] We are working with the vLLM community to support [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162).
+```bash
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+export CANN_INSTALL_PATH=/usr/local/Ascend/cann-8.5.1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export PYTHONUNBUFFERED=1
+export SOC_VERSION=ascend910_9391
+export NANOVLLM_CANN_BUILD_JOBS=64
+export NANOVLLM_EXT_BUILD_JOBS=1
 
-</details>
+bash scripts/build_nanovllm_ops.sh
+```
 
----
+运行前设置：
 
-## Overview
+```bash
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
 
-vLLM Ascend (`vllm-ascend`) is a community maintained hardware plugin for running vLLM seamlessly on the Ascend NPU.
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=4
+```
 
-It is the recommended approach for supporting the Ascend backend within the vLLM community. It adheres to the principles outlined in the [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162), providing a hardware-pluggable interface that decouples the integration of the Ascend NPU with vLLM.
+## 运行 UT
 
-By using vLLM Ascend plugin, popular open-source models, including Transformer-like, Mixture-of-Experts (MoE), Embedding, Multi-modal LLMs can run seamlessly on the Ascend NPU.
+### 短序列完整回归
 
-For detailed information on supported models, please refer to [supported models](https://docs.vllm.ai/projects/ascend/en/latest/user_guide/support_matrix/supported_models.html).
+`all` 会执行 payload codec、Q8/Q12/Q14 宽路、严格稳态语义、真实淘汰、首次
+卸载、correctness、lifecycle、invalid 和基础 perf。BF16/FP16 均需执行：
 
-## Prerequisites
+```bash
+for DTYPE in bf16 fp16; do
+  python3 ut_ops/test_fused_li_manage_mtp.py \
+    --mode all \
+    --device npu:0 \
+    --heads 32 \
+    --dtype "$DTYPE" \
+    --q-pattern 1,2,3,4,5,6,7 \
+    --source-capacity 16384 \
+    --offload-len 8192 \
+    --cache-tokens 8192 \
+    --warmup 10 \
+    --iters 300 \
+    --seed 7
+done
+```
 
-- Hardware: Atlas 800I A2 Inference series, Atlas A2 Training series, Atlas 800I A3 Inference series, Atlas A3 Training series, Atlas 300I Duo (Experimental)
-- OS: Linux
-- Software:
-    - Python >= 3.10, < 3.13
-    - CANN == 9.1.0 (For Ascend HDK version, please refer to the [CANN 9.1.0 Release Notes](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/releasenote/9.1.0/release-notes.md))
-    - PyTorch == 2.10.0, TorchNPU == 2.10.0.post4
-    - vLLM (the same version as vllm-ascend)
+`all` 中的固定 wide case 已覆盖 Q8/Q12/Q14、C32640、Q14 全不重叠
+union=28672、Q15 拒绝和旧 `[B,16384]` ABI 拒绝。调用方 Q1–14 混合布局可再用
+以下轻量 correctness 验证：
 
-## Getting Started
+```bash
+python3 ut_ops/test_fused_li_manage_mtp.py \
+  --mode correctness \
+  --device npu:0 \
+  --heads 32 \
+  --dtype bf16 \
+  --q-pattern 1,2,3,4,5,6,7,8,9,10,11,12,13,14 \
+  --source-capacity 32896 \
+  --offload-len 32768 \
+  --cache-tokens 32640 \
+  --warmup 1 \
+  --iters 1 \
+  --seed 7
+```
 
-Please use the following recommended versions to get started quickly:
+### 长序列完整回归
 
-| Version    | Release type | Doc                                  |
-|------------|--------------|--------------------------------------|
-| v0.23.0 | Latest stable version | See [QuickStart](https://docs.vllm.ai/projects/ascend/en/v0.23.0/quick_start.html) and [Installation](https://docs.vllm.ai/projects/ascend/en/v0.23.0/installation.html) for more details |
+`long-regression` 单独覆盖 Q1/4/7/8/12/14 的 `-3/-2/-1`、真实 `L>C`
+淘汰、首次卸载、三条 lifecycle、混合 Q/状态、replacement、first decode、
+21-bit 边界、4-bit key-tag cutoff 和代表性 invalid。它必须满足
+`source_capacity = offload_len + 128`，不应把这些大张量参数直接传给 `all`。
 
-## Branch
+`131072` 是不使用 key tag 的直接编码上界；`131200` 是第一个 128 对齐的长路径
+验收点。最大卸载 prefix 为 `2097024 = 2^21 - 128`。
 
-vllm-ascend has a main branch and a dev branch.
+```bash
+# 128K 直接编码边界使用普通 correctness。
+python3 ut_ops/test_fused_li_manage_mtp.py \
+  --mode correctness \
+  --device npu:0 \
+  --heads 32 \
+  --dtype bf16 \
+  --q-pattern 1,4,7 \
+  --source-capacity 131072 \
+  --offload-len 130944 \
+  --cache-tokens 14336 \
+  --warmup 1 \
+  --iters 1 \
+  --seed 7
 
-- **main**: main branch, corresponds to the vLLM main branch, and is continuously monitored for quality through Ascend CI.
-- **releases/vX.Y.Z**: development branch, created alongside new releases of vLLM. For example, `releases/v0.13.0` is the dev branch for vLLM `v0.13.0` version.
+# 128K+128、256Ki、1Mi 和最大 2Mi-128 长路径。
+for SOURCE_LEN in 131200 262144 1048576 2097024; do
+  for DTYPE in bf16 fp16; do
+    python3 ut_ops/test_fused_li_manage_mtp.py \
+      --mode long-regression \
+      --device npu:0 \
+      --heads 32 \
+      --dtype "$DTYPE" \
+      --source-capacity $((SOURCE_LEN + 128)) \
+      --offload-len "$SOURCE_LEN" \
+      --warmup 1 \
+      --iters 1 \
+      --seed 7
+  done
+done
+```
 
-Below are the maintained branches:
+### `--mode` 支持
 
-| Branch           | Status       | Note                                 |
-|------------------|--------------|--------------------------------------|
-| main             | Maintained   | CI commitment for vLLM main branch and vLLM v0.23.0 tag |
-| v0.7.1-dev       | Unmaintained | Outdated, no longer maintained. |
-| v0.7.3-dev       | Unmaintained | Only bug fixes are allowed, and no new release tags anymore. |
-| v0.9.1-dev       | Unmaintained | Only bug fixes are allowed, and no new release tags anymore. |
-| v0.11.0-dev      | Unmaintained | Only bug fixes are allowed, and no new release tags anymore. |
-| releases/v0.13.0 | Maintained   | CI commitment for vLLM 0.13.0 version |
-| releases/v0.18.0 | Maintained   | CI commitment for vLLM 0.18.0 version |
-| releases/v0.20.2rc | Maintained | CI commitment for vLLM 0.20.2 version |
-| rfc/feature-name | Maintained   | [Feature branches](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html#feature-branches) for collaboration |
-| releases/v0.23.0 | Maintained   | CI commitment for vLLM 0.23.0 version |
-  
-Please refer to [Versioning policy](https://docs.vllm.ai/projects/ascend/en/latest/community/versioning_policy.html) for more details.
+- `correctness`：按 `--q-pattern` 验证 `-3/-2/-1` 单状态和混合状态的 TopK、
+  slot、union、miss 和 pool mapping。
+- `lifecycle`：验证 `-2 -> -1 -> -1`、`-3 -> -1`、
+  `-3 -> -2 -> -1`。
+- `replacement-regression` / `steady-semantic-regression`：验证 `L>C` 真实淘汰、
+  victim 合法唯一、slot 双射、随机 mapping/block table 和重复稳态。
+- `first-decode-regression`：验证 `L>C` 首次 resident 初始化及 identity row 重建。
+- `payload-codec-regression`：验证 15/17-bit payload、slot/source 边界和 invalid。
+- `wide-route-regression`：验证每个 Q8–Q14 的 `-3/-2/-1`、C32640，以及 Q14
+  每路 2048 miss、全不重叠 union=28672。
+- `wide-compact-union-regression`：验证 Q8/Q12/Q14 普通宽路 union 与 route
+  destination publication。
+- `occurrence-regression`：验证 Q1–Q14、多档 miss、高 occurrence、Q4 的实际
+  `4092/4096/4100` 快路边界、历史 `6908/6912/6916` 邻点，以及 Q4/Q7/Q14
+  最大 disjoint source-join fallback。
+- `key-tag-regression`：验证 4-bit tag、0–16 ULP 和跨 `2^17` cutoff；也由
+  `long-regression` 自动执行。
+- `long-regression`：长序列状态、生命周期、宽路、淘汰、首次卸载和边界集合。
+- `invalid`：验证 Host 静态拒绝和 kernel 动态保护。
+- `perf` / `standard-mtp-perf` / `first-decode-perf` / `mtp-perf`：基础、非卸载、
+  首次卸载和卸载稳态计时。
+- `mixed-mtp-perf` / `mixed-standard-mtp-perf`：同批混合 Q 的卸载/非卸载计时。
+- `mixed-state-perf`：同一批次同时混合 Q 和 `-3/-2/-1` 状态计时。
+- `all`：短序列完整集合；不代替 `long-regression`。
 
-## Contributing
+高 occurrence 边界可单独复测；Q1–Q14 均有代表用例，occurrence 覆盖低值、
+2049、4096 邻域和 6908/6912/6916；Q4 额外精确覆盖 4092、4096、4100。
+该专项把物理 source capacity 保持在 `2^17`，只验证 occurrence publication；
+长序列 key-tag 扰动由 `key-tag-regression` 和 `long-regression` 单独验证：
 
-See [CONTRIBUTING](https://docs.vllm.ai/projects/ascend/en/latest/developer_guide/contribution/index.html) for more details, which is a step-by-step guide to help you set up the development environment, build and test.
+```bash
+python3 ut_ops/test_fused_li_manage_mtp.py \
+  --mode occurrence-regression \
+  --device npu:0 \
+  --heads 32 \
+  --dtype bf16 \
+  --source-capacity 131072 \
+  --offload-len 130944 \
+  --warmup 1 \
+  --iters 1 \
+  --seed 7
+```
 
-We welcome and value any contributions and collaborations:
+测试失败时，union 断言会报告首个错误索引及实际/期望窗口；TopK destination
+断言会额外报告 route、source、miss/hit 类型、最终 cache slot 和相邻 slot 窗口。
+这两类诊断只在失败时产生，不改变算子接口或性能计时。
 
-- Please let us know if you encounter a bug by [filing an issue](https://github.com/vllm-project/vllm-ascend/issues)
-- Please use [User forum](https://discuss.vllm.ai/c/hardware-support/vllm-ascend-support) for usage questions and help.
+## 性能测试脚本
 
-## Weekly Meeting
+所有脚本使用 NPU event，报告 median/p95。建议同机连续跑三轮，比较
+`overhead = fused - official` 的三轮中位数。长序列只测 BS=1/2/5；BS=16/24
+的大张量显存与频率影响较大，不作为常规验收口径。
 
-- vLLM Ascend Weekly Meeting: <https://tinyurl.com/vllm-ascend-meeting>
-- Wednesday, 15:00 - 16:00 (UTC+8, [Convert to your timezone](https://dateful.com/convert/gmt8?t=15))
+### 非卸载 `-3`：MTP0–10
 
-## License
+```bash
+for SOURCE_LEN in 65536 131072 131200 524288 1048576 2097024; do
+  if [ "$SOURCE_LEN" -le 131200 ]; then
+    BATCHES="1 2 5 16 24"
+  else
+    BATCHES="1 2 5"
+  fi
 
-Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
+  for MTP in $(seq 0 10); do
+    Q=$((MTP + 1))
+    for BS in $BATCHES; do
+      python3 ut_ops/test_fused_li_manage_mtp.py \
+        --mode standard-mtp-perf \
+        --device npu:0 \
+        --q-pattern "$Q" \
+        --batch-size "$BS" \
+        --heads 32 \
+        --dtype bf16 \
+        --source-len "$SOURCE_LEN" \
+        --warmup 10 \
+        --iters 300 \
+        --seed 7
+    done
+  done
+done
+```
+
+### 卸载稳态 `-1`：MTP0–10
+
+Q1–7 沿用成熟口径；Q8–11 使用 `C=Q*2048`、每路 miss=200、union=600。
+
+```bash
+for SOURCE_LEN in 65536 131072 131200 524288 1048576 2097024; do
+  if [ "$SOURCE_LEN" -le 131200 ]; then
+    BATCHES="1 2 5 16 24"
+  else
+    BATCHES="1 2 5"
+  fi
+
+  for MTP in $(seq 0 10); do
+    Q=$((MTP + 1))
+    case "$MTP" in
+      0)     CACHE_TOKENS=8192;  UNION_MISSES=200 ;;
+      1|2|3) CACHE_TOKENS=12288; UNION_MISSES=300 ;;
+      4|5)   CACHE_TOKENS=12288; UNION_MISSES=400 ;;
+      6)     CACHE_TOKENS=14336; UNION_MISSES=400 ;;
+      *)     CACHE_TOKENS=$((Q * 2048)); UNION_MISSES=600 ;;
+    esac
+
+    for BS in $BATCHES; do
+      python3 ut_ops/test_fused_li_manage_mtp.py \
+        --mode mtp-perf \
+        --device npu:0 \
+        --q-pattern "$Q" \
+        --batch-size "$BS" \
+        --heads 32 \
+        --dtype bf16 \
+        --source-len "$SOURCE_LEN" \
+        --cache-tokens "$CACHE_TOKENS" \
+        --query-miss-count 200 \
+        --union-miss-count "$UNION_MISSES" \
+        --query-noise 0.25 \
+        --warmup 10 \
+        --iters 300 \
+        --seed 7
+    done
+  done
+done
+```
+
+### 首次卸载 `-2`：MTP0–10
+
+```bash
+for SOURCE_LEN in 65536 131072 131200 524288 1048576 2097024; do
+  if [ "$SOURCE_LEN" -le 131200 ]; then
+    BATCHES="1 2 5 16 24"
+  else
+    BATCHES="1 2 5"
+  fi
+
+  for MTP in $(seq 0 10); do
+    Q=$((MTP + 1))
+    case "$MTP" in
+      0)     CACHE_TOKENS=8192 ;;
+      1|2|3|4|5) CACHE_TOKENS=12288 ;;
+      6)     CACHE_TOKENS=14336 ;;
+      *)     CACHE_TOKENS=$((Q * 2048)) ;;
+    esac
+
+    for BS in $BATCHES; do
+      python3 ut_ops/test_fused_li_manage_mtp.py \
+        --mode first-decode-perf \
+        --device npu:0 \
+        --q-pattern "$Q" \
+        --batch-size "$BS" \
+        --heads 32 \
+        --dtype bf16 \
+        --source-capacity $((SOURCE_LEN + 128)) \
+        --offload-len "$SOURCE_LEN" \
+        --cache-tokens "$CACHE_TOKENS" \
+        --warmup 10 \
+        --iters 300 \
+        --seed 7
+    done
+  done
+done
+```
+
+### 混合 MTP、混合 state
+
+同一 invocation 同时包含不同 Q，并覆盖两状态组合 `-1/-2`、`-1/-3`、
+`-2/-3` 以及完整的 `-3/-2/-1` 组合。`-1` 请求使用具有精确 union miss 数的
+resident cache，`-2` 请求每轮从空 pool row 开始，`-3` 请求每轮从未初始化 row
+开始，因此计时包含各状态的真实管理开销。
+
+```bash
+for SPEC in \
+  "1,4|-1,-2" \
+  "1,4|-1,-3" \
+  "1,4|-2,-3" \
+  "1,4,7|-3,-2,-1" \
+  "1,4,7,8,11|-3,-1,-2,-3,-1" \
+  "1,2,3,4,5,6,7,8,9,10,11|-3,-1,-1,-2,-1,-3,-1,-2,-1,-3,-1"; do
+  PATTERN=${SPEC%%|*}
+  STATES=${SPEC#*|}
+  for BS in 1 2 5; do
+    python3 ut_ops/test_fused_li_manage_mtp.py \
+      --mode mixed-state-perf \
+      --device npu:0 \
+      --q-pattern "$PATTERN" \
+      --state-pattern="$STATES" \
+      --batch-size "$BS" \
+      --heads 32 \
+      --dtype bf16 \
+      --source-capacity 65664 \
+      --offload-len 65536 \
+      --cache-tokens 32640 \
+      --union-miss-count 600 \
+      --warmup 10 \
+      --iters 300 \
+      --seed 7
+  done
+done
+```
+
+Q14、每路 miss=2048、全不重叠 union=28672 的精确边界已由
+`wide-route-regression` 做正确性验收。常规性能脚本不把该极端构造混入随机
+workload，避免把数据生成失败误判为 kernel 性能问题。
