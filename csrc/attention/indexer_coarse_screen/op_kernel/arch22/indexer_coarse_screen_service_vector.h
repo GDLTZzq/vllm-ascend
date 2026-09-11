@@ -646,23 +646,15 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K || cuS2Len == s2BaseSize_) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
                 if (constInfo_.isSparseCountOver2K) {
-                    // 2026-08-31 v11 根因修复: over2k 归并只用 2-list。双累积
-                    //   acc_U(排名1-2048)+acc_L(排名2049-4096)。每 chunk SortAll(512) 后两次
-                    //   2-list 归并(mrgDstNum=virTopK/2=2048≤3072, 永不进 3-segment):
-                    //     MergeSort(acc_U, 2048, chunk, len, tmpUb_): 被丢弃的 len 个最小对留在
-                    //       tmpUb_[virTopK, virTopK+2*len)(MrgSort 全量输出, DataCopy 只拷回前 2048)
-                    //     MergeSort(acc_L, 2048, tmpUb_[virTopK], len, tmpUb_[virTopK+2*len])
-                    //   输出 = acc_U+acc_L 拼接 == top-4096, 与旧单次 4096 归并逐位一致。
-                    SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign); // 整块 512 排序(probe prod 同款, 实证可靠)
+                    // over2k 单次全宽归并(与生产 lightning_indexer over2k 路径逐位同形):
+                    //   mrgDstNum=virTopK=4096 走 MergeSort 的 3-segment(>3072)分支,
+                    //   dst 内 3 段 + mrgSrc 一次 4-queue MrgSort 直接产出 top-4096。
+                    //   旧的"双累加 acc_U/acc_L 两次 2-list 归并"实测劣化为
+                    //   "chunk 逆序拼接 + 块内未排序", 根因在 2-list 分支的语义, 弃用。
+                    SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign); // 整块排序(probe prod 同款, 实证可靠)
                     PipeBarrier<PIPE_V>();
-                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK / 2,
+                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
                                             reduceOutBuff, cuS2LenVecAlign, tmpUb_);
-                    // 2026-09-01 aarch64 原生工具链(严格模式)拒收 LocalTensor::operator[] 临时量作
-                    //   非 const 左值引用形参(mrgSrc/tmpTensor): 先提命名变量。
-                    LocalTensor<float> ubTail = tmpUb_[virTopK];
-                    LocalTensor<float> ubScratch = tmpUb_[virTopK + 2 * cuS2LenVecAlign];
-                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2 + virTopK], virTopK / 2,
-                                            ubTail, cuS2LenVecAlign, ubScratch);
                 } else if (cuS2LenVecAlign == s2BaseSize_) {
                     IndexerCoarseScreenServiceVec::SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
                     PipeBarrier<PIPE_V>();
