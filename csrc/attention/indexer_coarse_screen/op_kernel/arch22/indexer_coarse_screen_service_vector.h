@@ -723,8 +723,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
                                    : info.actS2Size;
                 uint32_t ownCount = (info.actS2NaturalLen > info.actS2Size)
                                   ? (info.actS2NaturalLen - info.actS2Size) : 0U;
-                vectorService.CopyOutCoarseRow(info.indiceOutOffset + cuS1Idx * constInfo_.outRowWidth,
-                                               innerS1Idx, coarseCnt, info.actS2Size, ownCount);
+                CopyOutCoarseRow(info.indiceOutOffset + cuS1Idx * constInfo_.outRowWidth,
+                                 innerS1Idx, coarseCnt, info.actS2Size, ownCount);
             } else if (needCopyWsGm) {
                 // vec1Res Gm = [aic, s1BaseSize_, 2, 2, topkOut_] float32
                 // vec1Param Gm = [aic, s1BaseSize_, 2, 16] int64
