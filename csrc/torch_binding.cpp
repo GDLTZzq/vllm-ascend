@@ -2423,7 +2423,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "npu_indexer_coarse_screen("
-            "Tensor query, Tensor key, Tensor weights, "
+            "Tensor query, Tensor key, Tensor weights, Tensor row_weights, "
             "*, "
             "Tensor? actual_seq_lengths_query=None, "
             "Tensor? actual_seq_lengths_key=None, "

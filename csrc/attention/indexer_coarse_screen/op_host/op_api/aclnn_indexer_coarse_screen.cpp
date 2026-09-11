@@ -32,7 +32,7 @@ extern "C" {
 namespace {
 
 extern aclnnStatus aclnnInnerIndexerCoarseScreenGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *key, const aclTensor *weights,
+    const aclTensor *query, const aclTensor *key, const aclTensor *weights, const aclTensor *rowWeights,
     const aclTensor *actualSeqLengthsQueryOptional, const aclTensor *actualSeqLengthsKeyOptional,
     const aclTensor *blockTableOptional, char *layoutQueryOptional,
     char *layoutKeyOptional, int64_t sparseCount,
@@ -41,10 +41,50 @@ extern aclnnStatus aclnnInnerIndexerCoarseScreenGetWorkspaceSize(
 extern aclnnStatus aclnnInnerIndexerCoarseScreen(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                          const aclrtStream stream);
 
+class TensorHolder {
+public:
+    TensorHolder(const aclTensor *&output, aclDataType dataType, std::string varName) {
+        inner_ = nullptr;
+        name_ = varName;
+        if (output == nullptr) {
+            std::vector<int64_t> shape = {0};
+            int64_t addr = 0xff;
+            inner_ = aclCreateTensor(shape.data(), shape.size(),
+                dataType, shape.data(), 0, ACL_FORMAT_ND,
+                shape.data(), shape.size(), static_cast<void *>(&addr));
+            output = inner_;
+        }
+    }
+
+    ~TensorHolder() {
+        if (inner_) {
+            aclDestroyTensor(inner_);
+            inner_ = nullptr;
+        }
+    }
+
+    void CheckTensorConditionalNotNull(bool conditional) const {
+        if (inner_ && conditional) {
+            OP_LOGW("Check %s != nullptr failed!", name_.c_str());
+        } else if (!inner_ && !conditional) {
+            OP_LOGW("Check %s == nullptr failed!", name_.c_str());
+        }
+    }
+
+    bool IsTensorNotNull() const {
+        return inner_ == nullptr;
+    }
+
+private:
+    const aclTensor *inner_;
+    std::string name_;
+};
+
 aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
         const aclTensor *query,
         const aclTensor *key,
         const aclTensor *weights,
+        const aclTensor *rowWeights,
         const aclTensor *actualSeqLengthsQueryOptional,
         const aclTensor *actualSeqLengthsKeyOptional,
         const aclTensor *blockTableOptional,
@@ -61,7 +101,7 @@ aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
     }
 
     return aclnnInnerIndexerCoarseScreenGetWorkspaceSize(
-        query, key, weights, actualSeqLengthsQueryOptional, actualSeqLengthsKeyOptional,
+        query, key, weights, rowWeights, actualSeqLengthsQueryOptional, actualSeqLengthsKeyOptional,
         blockTableOptional, layoutQueryOptional, layoutKeyOptional, sparseCount, sparseIndicesOut, workspaceSize,
         executor);
 }

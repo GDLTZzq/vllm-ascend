@@ -1,12 +1,12 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
-  */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 /*!
  * \file indexer_coarse_screen_service_vector.h
@@ -68,7 +68,17 @@ public:
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<float> vec1ResGm,
                                                 GlobalTensor<int64_t> vec1ParamGm, GlobalTensor<W_T> weightsGm,
                                                 GlobalTensor<int32_t> indiceOutGm);
+    // Stage-1 组均值代理池化:本核对 b 区间 [bStart,bEnd] 逐请求计算 q_bar/w_bar 写 workspace
+    __aicore__ inline void InitPreprocessTensor(GlobalTensor<Q_T> queryGm, GlobalTensor<W_T> inputWeightsGm,
+                                                GlobalTensor<W_T> rowWeightsGm, GlobalTensor<Q_T> qBarGm,
+                                                GlobalTensor<W_T> wBarGm, GlobalTensor<uint32_t> actualSeqLengthsGmQ);
+    __aicore__ inline void PreprocessMean(uint32_t bStart, uint32_t bEnd);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
+    // 输出一整行 = [粗筛 top-min(L,sparseCount) 的索引][自有 token L..L+gR-1][-1 pad],
+    // 行宽 = outRowWidth = Align8(sparseCount + gMax)。coarseCnt==0 时不读 topk 源(L==0 首
+    // token 请求:整行 = [0,ownCount) 自有 token + pad)。
+    __aicore__ inline void CopyOutCoarseRow(int64_t gmRowOffset, int32_t innerS1Idx, uint32_t coarseCnt,
+                                           uint32_t ownStart, uint32_t ownCount);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void InitLDBuffers(TPipe *pipe);
@@ -79,6 +89,13 @@ protected:
     GlobalTensor<int64_t> vec1ParamGm;
     GlobalTensor<W_T> weightsGm;
     GlobalTensor<int32_t> indiceOutGm;
+    // Stage-1 池化输入(query 原值 TND、逐行 weights、row_weights)与代理输出 workspace
+    GlobalTensor<Q_T> queryGm;           // 输入 query [N,H,D] TND(Stage-1 池化读)
+    GlobalTensor<W_T> inputWeightsGm;    // 输入 weights [N,H](Stage-1 池化读)
+    GlobalTensor<W_T> rowWeightsGm;      // 输入 row_weights [R,g](Stage-1 池化读)
+    GlobalTensor<Q_T> qBarGm;            // workspace [K,H,D] bf16 池化代理 query(Stage-2 cube 读)
+    GlobalTensor<W_T> wBarGm;            // workspace [K,Align16(H)] bf16 池化代理 weights(DoScale 读前 H 值)
+    GlobalTensor<uint32_t> actualSeqLengthsGmQ; // aslq_q cum(池化取组宽 g_r)
     // =================================常量区=================================
 
 private:
@@ -122,6 +139,9 @@ private:
 
     constexpr static uint32_t REDUCE_BANK_CONFLICT_OFFSETS = 256;
     constexpr static uint32_t REDUCE_BANK_CONFLICT_NUM = REDUCE_BANK_CONFLICT_OFFSETS / sizeof(float);
+    // Stage-1 池化块参数
+    constexpr static uint32_t PREPROCESS_ROWS_CHUNK = 16; // 每块加载的 query 行数(UB 上界)
+    constexpr static uint32_t PREPROCESS_MAX_GROUP = 512; // 每请求组宽 g_r 上界(元组宽度)
 
     struct IndexerCoarseScreenCommon::ConstInfo constInfo_;
 };
@@ -129,16 +149,29 @@ private:
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitBuffers(TPipe *pipe)
 {
+    // CopyOut 段需求(单 outValueUb,Extract 形态): 值[0,offset) + 索引[offset,2offset) = 2*offset floats。
+    //   non-Over2K: offset=virTopK=2048, copyLen<=2048 → 4096;Over2K: offset=copyOff, copyNum=2 → 4096。
+    //   reduceCacheBuf(groupInner_*s2BaseSize_+offsets) 更大,outQueue_ 按其取 max,富余充足。
+    // coarse:sparseCount=4096(over2k 用例) — offset=virTopK=4096, 2*offset=8192 floats=32KB。
     uint32_t outNeedBufSize = (BASE_TOPK * 2) * 2 * sizeof(float);
+    if (constInfo_.isSparseCountOver2K) {
+        int64_t copyOff = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
+                              ? constInfo_.sparseCount
+                              : constInfo_.sparseCount / 2;
+        outNeedBufSize = 2 * copyOff * sizeof(float);
+    }
     uint32_t reduceCacheSize = REDUCE_BANK_CONFLICT_OFFSETS + groupInner_ * s2BaseSize_ * sizeof(float);
     outNeedBufSize = reduceCacheSize > outNeedBufSize ? reduceCacheSize : outNeedBufSize;
     virTopK = constInfo_.isSparseCountOver2K ? constInfo_.sparseCount : BASE_TOPK;
 
     pipe->InitBuffer(outQueue_, 1, outNeedBufSize);                                            // 32KB  extract
     // 68KB 在搬运cube核计算得到的结果和weight时，分成两块34KB，用于db；在mrgsort时，用作临时UB
+    // 输出行组装(CopyOutCoarseRow)也借用本块前段:此时归并 scratch 已用完(见该函数注释)。
     pipe->InitBuffer(tmpBuf_, (groupInner_ * s2BaseSize_ + s2BaseSize_) * 2 * sizeof(float));
     pipe->InitBuffer(sortOutBuf_, CeilDiv(s1BaseSize_, 2) * virTopK * 2 * sizeof(float));    // 64KB
     pipe->InitBuffer(indexBuf_, s2BaseSize_ * sizeof(int32_t));                                // 2KB
+    // coarse:无 candidates 掩码链 → reduceOutBuf_ 收缩回生产形态 2×s2BaseSize_
+    //   [0,V) 分数 + [V,2V) 索引(cols),与生产 lightning_indexer 逐位一致。
     pipe->InitBuffer(reduceOutBuf_, s2BaseSize_ * 2 * sizeof(float));                          // 4KB
     pipe->InitBuffer(brcBuf_, groupInner_ * 8 * sizeof(float));
     pipe->InitBuffer(paramBuf_, LD_PARAM_NUM * sizeof(int64_t));
@@ -213,6 +246,21 @@ IndexerCoarseScreenServiceVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT
 }
 
 template <typename LIT>
+__aicore__ inline void
+IndexerCoarseScreenServiceVector<LIT>::InitPreprocessTensor(GlobalTensor<Q_T> queryGm,
+                                    GlobalTensor<W_T> inputWeightsGm,
+                                    GlobalTensor<W_T> rowWeightsGm, GlobalTensor<Q_T> qBarGm,
+                                    GlobalTensor<W_T> wBarGm, GlobalTensor<uint32_t> actualSeqLengthsGmQ)
+{
+    this->queryGm = queryGm;
+    this->inputWeightsGm = inputWeightsGm;
+    this->rowWeightsGm = rowWeightsGm;
+    this->qBarGm = qBarGm;
+    this->wBarGm = wBarGm;
+    this->actualSeqLengthsGmQ = actualSeqLengthsGmQ;
+}
+
+template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::AllocEventID()
 {
     SetFlag<HardEvent::V_MTE2>(EVENTID_V_TO_MTE2_PING);
@@ -231,14 +279,255 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::FreeEventID()
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CleanInvalidOutput(int64_t invalidS1offset)
 {
-    // init -1 and copy to output
+    // init -1 and copy to output(整行 outRowWidth,coarse 行宽)
     LocalTensor<float> valueULocal = outQueue_.AllocTensor<float>();
     LocalTensor<int32_t> idxULocal1 = valueULocal.template ReinterpretCast<int32_t>();
-    Duplicate(idxULocal1, constInfo_.INVALID_IDX, constInfo_.sparseCount);
+    Duplicate(idxULocal1, constInfo_.INVALID_IDX, constInfo_.outRowWidth);
     outQueue_.EnQue<float>(valueULocal);
     valueULocal = outQueue_.DeQue<float>();
-    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[invalidS1offset], idxULocal1, constInfo_.sparseCount);
+    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[invalidS1offset], idxULocal1, constInfo_.outRowWidth);
     outQueue_.FreeTensor(valueULocal);
+}
+
+// A1 修订:输出行 = [粗筛 top-min(L,sparseCount)][自有 token L..L+gR-1][-1 pad]。
+//   * 粗筛段:Extract 分离 globalTopkUb_ 的 (value,index) 交错对取索引。over2k(4096) 下
+//     globalTopkUb_[innerS1Idx*virTopK*2] 起 2*virTopK floats = acc_U++acc_L 拼接 = 完整
+//     top-4096 对(offset=virTopK,copyNum=1);>4K 分两块依次拼接。有效前缀数 = min(L,sparseCount),
+//     其尾段在 InitSortOutBuf 已置 -1,故只取前 coarseCnt 个。
+//   * 自有段:[L, L+gR) 升序 gR 个(域 [0,L) 已排除自有 token,无重复)。L==0 时 coarseCnt=0、
+//     ownStart=0、ownCount=aslk,整行 = [0,aslk) + pad。
+//   * pad:标量补至 8 元素对齐,再 Duplicate(-1) 批量到 outRowWidth(对齐由调用方保证)。
+//   * 行缓冲借用 tmpUb_ 前段:此时本请求的归并 scratch 已用完(见 ProcessVec 归并段)。
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CopyOutCoarseRow(int64_t gmRowOffset,
+                                                                               int32_t innerS1Idx,
+                                                                               uint32_t coarseCnt,
+                                                                               uint32_t ownStart,
+                                                                               uint32_t ownCount)
+{
+    const int32_t rowWidth = static_cast<int32_t>(constInfo_.outRowWidth);
+    int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? static_cast<int64_t>(virTopK)
+                                                                 : static_cast<int64_t>(constInfo_.sparseCount / 2);
+    int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? static_cast<int64_t>(virTopK)
+                                                                  : static_cast<int64_t>(constInfo_.sparseCount / 2);
+    int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
+
+    LocalTensor<int32_t> rowUb = tmpUb_.template ReinterpretCast<int32_t>();
+    int32_t written = 0;
+    for (int64_t i = 0; i < copyNum; i++) {
+        int64_t chunkStart = i * copyLen;
+        if (chunkStart >= static_cast<int64_t>(coarseCnt)) {
+            break;
+        }
+        int64_t take = static_cast<int64_t>(coarseCnt) - chunkStart;
+        take = (take > copyLen) ? copyLen : take;
+        LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
+        LocalTensor<uint32_t> outIdxUb = outValueUb[offset].template ReinterpretCast<uint32_t>();
+        Extract(outValueUb, outIdxUb, globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset], offset / 32);
+        LocalTensor<int32_t> idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
+        outQueue_.EnQue<float>(outValueUb);
+        outValueUb = outQueue_.DeQue<float>();
+        idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
+        // dst 起点 / copyLen 恒 32B 对齐(chunk 边界 = copyLen 倍数),take 不足时后续块必跳过。
+        // 尾部(含 Adds 末块可能触及的 [coarseCnt, align8))随后被自有段/pad 整段重写,无残留。
+        LocalTensor<int32_t> coarseDst = rowUb[written];
+        Adds(coarseDst, idxULocal1, static_cast<int32_t>(0), static_cast<int32_t>(take));
+        PipeBarrier<PIPE_V>();
+        outQueue_.FreeTensor(outValueUb);
+        written += static_cast<int32_t>(take);
+    }
+
+    // 自有 token 升序 [ownStart, ownStart+ownCount)(标量写,起点任意对齐)
+    for (uint32_t i = 0; i < ownCount; i++) {
+        rowUb.SetValue(written + static_cast<int32_t>(i), static_cast<int32_t>(ownStart + i));
+    }
+    written += static_cast<int32_t>(ownCount);
+
+    // -1 补齐:标量补到 8 元素对齐首(Duplicate 要求 32B 对齐),其余批量
+    int32_t padStart = (written + 7) & ~7;
+    for (int32_t i = written; i < padStart; i++) {
+        rowUb.SetValue(i, constInfo_.INVALID_IDX);
+    }
+    if (padStart < rowWidth) {
+        LocalTensor<int32_t> padDst = rowUb[padStart];
+        Duplicate(padDst, constInfo_.INVALID_IDX, rowWidth - padStart);
+    }
+    AscendC::PipeBarrier<PIPE_ALL>();
+    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[gmRowOffset], rowUb, rowWidth);
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+// Stage-1 组均值代理池化:对本核对 b 区间 [bStart,bEnd] 逐请求计算
+//   q_bar[r,h] = Σ_i rw[r,i]·query[cum[r-1]+i,h,:] / Σ_i rw[r,i]  → qBarGm [K,H,D] bf16
+//   w_bar[r,h] = Σ_i rw[r,i]·weights[cum[r-1]+i,h]     / Σ_i rw[r,i]  → wBarGm [K,Align16(H)] bf16
+// 精度:fp32 累加、按 rw 逐行加权、乘以 1/Σrw、bf16 CAST_ROUND —— 匹配 torch .mean(dim=1)。
+// 约定:row_weights 行宽 = g_r(cum 差分),PIVOT decode 组宽恒定,正确;组宽>PREPROCESS_MAX_GROUP 越界。
+// 幂等:同核对两个 AIV 各自全量池化 [bStart,bEnd](冗余写,值一致)。
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::PreprocessMean(uint32_t bStart, uint32_t bEnd)
+{
+    const int32_t headDim = static_cast<int32_t>(constInfo_.headDim);
+    const int32_t gSize = static_cast<int32_t>(constInfo_.gSize);
+    // w_bar 行步长对齐 16 元素(32B):GM 写 blockLen/行首需 32B 对齐,H 任意(如 probe H=8)。
+    const int32_t hPad = (gSize + 15) / 16 * 16;
+
+    // tmpUb_ 划段(池化先于主流水,68KB 富余;仅写 tmpUb_,不动 globalTopkIndice_/globalTopkUb_)
+    uint32_t f = 0;
+    LocalTensor<float> qAccUb = tmpUb_[f];
+    f += static_cast<uint32_t>(headDim);
+    LocalTensor<float> invUb = tmpUb_[f];
+    f += 8;
+    LocalTensor<float> wF32Ub = tmpUb_[f];
+    f += PREPROCESS_MAX_GROUP;
+    LocalTensor<float> wBarUb = tmpUb_[f];
+    f += 512; // H 上界
+    LocalTensor<float> rowUbF32 = tmpUb_[f];
+    f += PREPROCESS_ROWS_CHUNK * static_cast<uint32_t>(headDim);
+    // w_bar 整行 staging(H=gSize 头宽的 inputWeights 行,浮点 rank-1 累加用;
+    // 标量 bf16 cast 不被 AIC 后端支持,必须整行搬入向量算,不能逐头标量读)
+    LocalTensor<float> wGmRowF32 = tmpUb_[f];
+    f += static_cast<uint32_t>(gSize);
+    // Q_T(2B)缓冲接在 float 区之后(字节偏移 f*4)
+    int64_t qOff = static_cast<int64_t>(f) * static_cast<int64_t>(sizeof(float));
+    LocalTensor<Q_T> rowUbBf16 = tmpUb_.template ReinterpretCast<Q_T>()[qOff / static_cast<int64_t>(sizeof(Q_T))];
+    LocalTensor<Q_T> wRowBf16 = rowUbBf16[PREPROCESS_ROWS_CHUNK * static_cast<uint32_t>(headDim)];
+    LocalTensor<Q_T> qBarBf16 = wRowBf16[PREPROCESS_MAX_GROUP];
+    LocalTensor<Q_T> wBarOutBf16 = qBarBf16[static_cast<uint32_t>(headDim)];
+
+    AscendC::DataCopyPadExtParams<Q_T> pad{false, 0, 0, 0};
+    for (uint32_t r = bStart; r <= bEnd; r++) {
+        uint32_t cumPrev = (r == 0) ? 0 : actualSeqLengthsGmQ.GetValue(r - 1);
+        uint32_t cumR = actualSeqLengthsGmQ.GetValue(r);
+        int32_t gR = static_cast<int32_t>(cumR - cumPrev);
+        if (gR <= 0) {
+            // 组宽为 0:代理写零,避免 cube 读到垃圾(请求仍可能被主流水处理)
+            Duplicate(qBarBf16.template ReinterpretCast<int32_t>(), 0, headDim * static_cast<int32_t>(sizeof(Q_T) / 2));
+            AscendC::PipeBarrier<PIPE_V>();
+            // 2026-09-08 修复:GM dst 的 DataCopyPad 无 pad 扩展重载(仅 LocalTensor dst 读有),
+            // 用 3 参 DataCopyParams 形式(见 vec1ParamGm 写 line ~202 先例)。
+            AscendC::DataCopyPad(qBarGm[static_cast<uint64_t>(r) * gSize * headDim], qBarBf16,
+                                 {1, static_cast<uint16_t>(headDim * gSize * sizeof(Q_T)), 0, 0});
+            AscendC::PipeBarrier<PIPE_MTE3>();
+            // w_bar 行步长对齐 16 元素(32B):行首 r*hPad 对齐,blockLen 32B 倍数,规避 GM 写对齐限制。
+            // DT_W_FLAG=1(wBarGm<float>):零化 wBarUb(float) 整行后以 float 写;否则零化 wBarOutBf16 2B 行。
+            if constexpr (DT_W_FLAG) {
+                Duplicate(wBarUb, 0.0f, hPad);
+            } else {
+                Duplicate(wBarOutBf16.template ReinterpretCast<int32_t>(), 0,
+                          gSize * static_cast<int32_t>(sizeof(Q_T) / 2));
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            if constexpr (DT_W_FLAG) {
+                AscendC::DataCopyPad(wBarGm[static_cast<uint64_t>(r) * hPad], wBarUb,
+                                     {1, static_cast<uint16_t>(hPad * sizeof(float)), 0, 0});
+            } else {
+                AscendC::DataCopyPad(wBarGm[static_cast<uint64_t>(r) * hPad], wBarOutBf16,
+                                     {1, static_cast<uint16_t>(hPad * sizeof(W_T)), 0, 0});
+            }
+            AscendC::PipeBarrier<PIPE_ALL>();
+            continue;
+        }
+        if (gR > static_cast<int32_t>(PREPROCESS_MAX_GROUP)) {
+            gR = static_cast<int32_t>(PREPROCESS_MAX_GROUP); // 防御:超界截断(数据错误优于越界)
+        }
+
+        // 载入本请求 row_weights 行(行宽按 g_r,行首 r*g_r)。
+        // DT_W_FLAG=1(rowWeightsGm<float>):直接 GM<float>→wF32Ub(float),免 Cast;否则 2B 读入再 Cast 到 float。
+        if constexpr (DT_W_FLAG) {
+            AscendC::DataCopy(wF32Ub, rowWeightsGm[static_cast<uint64_t>(r) * gR], gR);
+            AscendC::PipeBarrier<PIPE_ALL>();
+        } else {
+            AscendC::DataCopy(wRowBf16, rowWeightsGm[static_cast<uint64_t>(r) * gR], gR);
+            AscendC::PipeBarrier<PIPE_MTE2>();
+            AscendC::Cast(wF32Ub, wRowBf16, RoundMode::CAST_NONE, gR);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
+        // totalW = Σ rw[r,i](fp32 标量),inv = 1/totalW(向量 Div,避免标量除法位差)
+        float totalW = 0.0f;
+        for (int32_t i = 0; i < gR; i++) {
+            totalW += wF32Ub.GetValue(i);
+        }
+        if (totalW == 0.0f) {
+            totalW = 1.0f;
+        }
+        AscendC::Duplicate(invUb, 1.0f, 1);
+        AscendC::PipeBarrier<PIPE_V>();
+        LocalTensor<float> totalWUb = invUb[1];
+        totalWUb.SetValue(0, totalW);
+        AscendC::Div(invUb, invUb, totalWUb, 1);
+        AscendC::PipeBarrier<PIPE_V>();
+        float invW = invUb.GetValue(0);
+
+        // w_bar 整行向量化:w_bar[h] = Σ_i rw[i] * inputWeights[(cumPrev+i)*H + h] * invW。
+        // 逐头标量 inputWeightsGm.GetValue + static_cast<float>(W_T) 在 AIC 后端不支持 bf16 标量 cast(DTW=0),
+        // 故按行连续搬入(H=gSize 宽)再 rank-1 累加;DTW=1(W_T=float) 直接读,免 Cast。
+        AscendC::Duplicate(wBarUb, 0.0f, gSize);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (int32_t i = 0; i < gR; i++) {
+            if constexpr (DT_W_FLAG) {
+                AscendC::DataCopy(wGmRowF32, inputWeightsGm[static_cast<uint64_t>(cumPrev + i) * gSize], gSize);
+                AscendC::PipeBarrier<PIPE_MTE2>();
+            } else {
+                AscendC::DataCopy(wRowBf16, inputWeightsGm[static_cast<uint64_t>(cumPrev + i) * gSize], gSize);
+                AscendC::PipeBarrier<PIPE_MTE2>();
+                AscendC::Cast(wGmRowF32, wRowBf16, RoundMode::CAST_NONE, gSize);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::Muls(wGmRowF32, wGmRowF32, wF32Ub.GetValue(i), gSize);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add(wBarUb, wBarUb, wGmRowF32, gSize);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        AscendC::Muls(wBarUb, wBarUb, invW, gSize);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        for (int32_t h = 0; h < gSize; h++) {
+            // q_bar:逐组行加权平均(D fp32 累加)
+            AscendC::Duplicate(qAccUb, 0.0f, headDim);
+            AscendC::PipeBarrier<PIPE_V>();
+            for (int32_t chunk = 0; chunk < gR; chunk += PREPROCESS_ROWS_CHUNK) {
+                int32_t rows = (chunk + PREPROCESS_ROWS_CHUNK > gR) ? gR - chunk : PREPROCESS_ROWS_CHUNK;
+                // query[cumPrev+i, h, :],i∈[chunk,chunk+rows):行距 H*D,行宽 D
+                uint64_t srcOff = (static_cast<uint64_t>(cumPrev + chunk) * gSize + h) * headDim;
+                uint32_t srcStride =
+                    (static_cast<uint32_t>(gSize) * headDim - headDim) * sizeof(Q_T) / 32;
+                AscendC::DataCopyPad(rowUbBf16, queryGm[srcOff],
+                                     {static_cast<uint16_t>(rows), static_cast<uint16_t>(headDim * sizeof(Q_T)),
+                                      static_cast<uint16_t>(srcStride), 0, 0},
+                                     pad);
+                AscendC::PipeBarrier<PIPE_MTE2>();
+                AscendC::Cast(rowUbF32, rowUbBf16, RoundMode::CAST_NONE, rows * headDim);
+                AscendC::PipeBarrier<PIPE_V>();
+                for (int32_t j = 0; j < rows; j++) {
+                    LocalTensor<float> rowSrc = rowUbF32[j * headDim];
+                    AscendC::Muls(rowSrc, rowSrc, wF32Ub.GetValue(chunk + j), headDim);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Add(qAccUb, qAccUb, rowSrc, headDim);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+            }
+            AscendC::Muls(qAccUb, qAccUb, invW, headDim);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(qBarBf16, qAccUb, RoundMode::CAST_ROUND, headDim);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::DataCopyPad(qBarGm[static_cast<uint64_t>(r) * gSize * headDim + static_cast<uint64_t>(h) * headDim],
+                                 qBarBf16, {1, static_cast<uint16_t>(headDim * sizeof(Q_T)), 0, 0});
+            AscendC::PipeBarrier<PIPE_MTE3>();
+        }
+        // w_bar 整行写(步长 hPad):仅 [0,gSize) 实值,pad 尾 [gSize,hPad) 从不被 DoScale 读,可留旧值。
+        // DT_W_FLAG=1(wBarGm<float>):wBarUb 即 fp32 行,直接写;否则 Cast 到 2B 再写。
+        if constexpr (DT_W_FLAG) {
+            AscendC::DataCopyPad(wBarGm[static_cast<uint64_t>(r) * hPad], wBarUb,
+                                 {1, static_cast<uint16_t>(hPad * sizeof(float)), 0, 0});
+        } else {
+            AscendC::Cast(wBarOutBf16, wBarUb, RoundMode::CAST_ROUND, gSize);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::DataCopyPad(wBarGm[static_cast<uint64_t>(r) * hPad], wBarOutBf16,
+                                 {1, static_cast<uint16_t>(hPad * sizeof(W_T)), 0, 0});
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
 }
 
 template <typename LIT>
@@ -333,14 +622,16 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             IndexerCoarseScreenServiceVec::DoReduce(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], reduceOutInner, gRedCnt, s2BaseSize_);
             outQueue_.FreeTensor(reduceCacheBuf);
 
+            // 无 candidates 掩码链 → 生产形态掩码:全宽预填 NEG_INF,[0,V) 分数只写一次、
+            // [V,2V) 索引只写一次(cols + 尾对齐 -1),与生产 lightning_indexer 逐位一致。
             LocalTensor<float> sortScoreUb = reduceOutBuff;
             LocalTensor<float> sortIndiceUb = reduceOutBuff[cuS2LenVecAlign];
-            Duplicate(sortScoreUb.template ReinterpretCast<int32_t>(), IndexerCoarseScreenServiceVec::NEG_INF, cuS2LenVecAlign);
+            LocalTensor<int32_t> scoreI32 = sortScoreUb.template ReinterpretCast<int32_t>();
+            LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
+            Duplicate(scoreI32, IndexerCoarseScreenServiceVec::NEG_INF, cuS2LenVecAlign);
             PipeBarrier<PIPE_V>();
             Adds(sortScoreUb, reduceOutInner, 0.0f, cuS2Len);
             PipeBarrier<PIPE_V>();
-            LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
-            // 无效数据索引填充为-1
             if (cuS2LenVecAlign != cuS2Len) {
                 Duplicate(sortIndiceUbInt, -1, cuS2LenVecAlign);
             }
@@ -350,14 +641,39 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             AscendC::PipeBarrier<PIPE_ALL>();
 
             LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-            if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K) {
+            if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K || cuS2Len == s2BaseSize_) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
-                IndexerCoarseScreenServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
-                                      cuS2LenVecAlign); //  cuS2LenVecAlign <= s2BaseSize_, fill -inf
-                PipeBarrier<PIPE_V>();
-                LocalTensor<float> UbTmpSort = constInfo_.isSparseCountOver2K ? tmpUb_ : tmpSortBuf;
-                IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
-                                        cuS2LenVecAlign, UbTmpSort);
+                if (constInfo_.isSparseCountOver2K) {
+                    // 2026-08-31 v11 根因修复: over2k 归并只用 2-list。双累积
+                    //   acc_U(排名1-2048)+acc_L(排名2049-4096)。每 chunk SortAll(512) 后两次
+                    //   2-list 归并(mrgDstNum=virTopK/2=2048≤3072, 永不进 3-segment):
+                    //     MergeSort(acc_U, 2048, chunk, len, tmpUb_): 被丢弃的 len 个最小对留在
+                    //       tmpUb_[virTopK, virTopK+2*len)(MrgSort 全量输出, DataCopy 只拷回前 2048)
+                    //     MergeSort(acc_L, 2048, tmpUb_[virTopK], len, tmpUb_[virTopK+2*len])
+                    //   输出 = acc_U+acc_L 拼接 == top-4096, 与旧单次 4096 归并逐位一致。
+                    SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign); // 整块 512 排序(probe prod 同款, 实证可靠)
+                    PipeBarrier<PIPE_V>();
+                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK / 2,
+                                            reduceOutBuff, cuS2LenVecAlign, tmpUb_);
+                    // 2026-09-01 aarch64 原生工具链(严格模式)拒收 LocalTensor::operator[] 临时量作
+                    //   非 const 左值引用形参(mrgSrc/tmpTensor): 先提命名变量。
+                    LocalTensor<float> ubTail = tmpUb_[virTopK];
+                    LocalTensor<float> ubScratch = tmpUb_[virTopK + 2 * cuS2LenVecAlign];
+                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2 + virTopK], virTopK / 2,
+                                            ubTail, cuS2LenVecAlign, ubScratch);
+                } else if (cuS2LenVecAlign == s2BaseSize_) {
+                    IndexerCoarseScreenServiceVec::SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
+                    PipeBarrier<PIPE_V>();
+                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
+                                            cuS2LenVecAlign, tmpSortBuf);
+                } else {
+                    IndexerCoarseScreenServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
+                                          cuS2LenVecAlign); //  cuS2LenVecAlign <= s2BaseSize_, fill -inf
+                    PipeBarrier<PIPE_V>();
+                    LocalTensor<float> UbTmpSort = constInfo_.isSparseCountOver2K ? tmpUb_ : tmpSortBuf;
+                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
+                                            cuS2LenVecAlign, UbTmpSort);
+                }
             } else {
                 int64_t globalTopkUbCacheIdx = (info.s2Idx - blockS2StartIdx_) % 4;
                 Sort<float, true>(
@@ -395,30 +711,20 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
 
             bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End;
 
-            // 中间结果保存
-            bool needCopyWsGm = info.isAllLoopEnd || isS2End;
+            // 中间结果保存:over2k 下每请求整 S2 单核处理,始终 needCopyOutGm 优先,ws/LD 路径死代码。
+            bool needCopyWsGm = info.isLastS2InnerLoop;
 
             if (needCopyOutGm) {
-                int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? virTopK : constInfo_.sparseCount / 2;
-                int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
-                                ? constInfo_.sparseCount
-                                : constInfo_.sparseCount / 2;
-                int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
-                for (int64_t i = 0; i < copyNum; i++) {
-                    LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
-                    LocalTensor<uint32_t> outIdxUb = outValueUb[offset].template ReinterpretCast<uint32_t>();
-                    Extract(outValueUb, outIdxUb,
-                     globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset], (offset /32));
-
-                    LocalTensor<int32_t> idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
-                    outQueue_.EnQue<float>(outValueUb);
-                    outValueUb = outQueue_.DeQue<float>();
-
-                    IndexerCoarseScreenServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
-                                                         constInfo_.sparseCount + i * offset],
-                                        idxULocal1, copyLen);
-                    outQueue_.FreeTensor(outValueUb);
-                }
+                // A1 修订:输出行 = [粗筛 top-min(L,sparseCount)][自有 token L..L+gR-1][-1 pad]。
+                //   粗筛有效前缀数 c = min(actS2Size=L, sparseCount);自有 token 数 gR = aslk − L
+                //   (aslk = 自然长度,域 [0,L) 已排除自有 token,故无重复)。
+                uint32_t coarseCnt = (info.actS2Size > static_cast<uint32_t>(constInfo_.sparseCount))
+                                   ? static_cast<uint32_t>(constInfo_.sparseCount)
+                                   : info.actS2Size;
+                uint32_t ownCount = (info.actS2NaturalLen > info.actS2Size)
+                                  ? (info.actS2NaturalLen - info.actS2Size) : 0U;
+                vectorService.CopyOutCoarseRow(info.indiceOutOffset + cuS1Idx * constInfo_.outRowWidth,
+                                               innerS1Idx, coarseCnt, info.actS2Size, ownCount);
             } else if (needCopyWsGm) {
                 // vec1Res Gm = [aic, s1BaseSize_, 2, 2, topkOut_] float32
                 // vec1Param Gm = [aic, s1BaseSize_, 2, 16] int64
@@ -441,7 +747,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
                 tmpiBuff.SetValue(5, static_cast<int64_t>(info.bN2Idx));
                 tmpiBuff.SetValue(6, static_cast<int64_t>(cuS1Idx));
                 tmpiBuff.SetValue(7, static_cast<int64_t>(cuS1ProcNum));
-                tmpiBuff.SetValue(8, static_cast<int64_t>(info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount));
+                tmpiBuff.SetValue(8, static_cast<int64_t>(info.indiceOutOffset + cuS1Idx * constInfo_.outRowWidth));
                 // 写入头尾判断
                 // [head, tail]
                 // head: 与前面规约，与前后规约
@@ -461,7 +767,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
                 SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
             }
         } else if (cuRealAcSeq <= 0) {
-            CleanInvalidOutput(info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount);
+            CleanInvalidOutput(info.indiceOutOffset + cuS1Idx * constInfo_.outRowWidth);
         }
     }
 
@@ -475,7 +781,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num, 2) : (invalidS1Num / 2);
             int32_t s1OffsetPerAiv = info.actS1Size + (blockId_ % 2) * CeilDiv(invalidS1Num, 2);
             for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
-                CleanInvalidOutput(info.indiceOutOffset + (s1OffsetPerAiv + innerS1Idx) * constInfo_.sparseCount);
+                CleanInvalidOutput(info.indiceOutOffset + (s1OffsetPerAiv + innerS1Idx) * constInfo_.outRowWidth);
             }
         }
 
@@ -485,7 +791,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             int32_t s1OffsetPerAiv = (blockId_ % 2) * CeilDiv(invalidS1Num2, 2);
             for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
                 CleanInvalidOutput((info.bN2Idx * constInfo_.qSeqSize + s1OffsetPerAiv + innerS1Idx) *
-                                   constInfo_.sparseCount);
+                                   constInfo_.outRowWidth);
             }
         }
     }
@@ -506,7 +812,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessLD()
     int64_t s2Start;
     int64_t s2End;
     int64_t isS2End;
-    int64_t bn2Idx;
     int64_t s1Idx;
     uint32_t acc_list_num = 0;
     int64_t bIdx = 0;
@@ -557,7 +862,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessLD()
         SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
         SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
         DataCopyPad(curValueIdxUb, vec1ResGm[wsOffset],
-                    {1, static_cast<uint16_t>(2 * BASE_TOPK * sizeof(int32_t)), 0, 0}, {true, 0, 0, 0});
+                    {1, static_cast<uint16_t>(2 * BASE_TOPK * sizeof(int32_t)), 0, 0, 0}, {true, 0, 0, 0});
         acc_list_num++;
         valueOffset += 2 * BASE_TOPK;
 
@@ -576,7 +881,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessLD()
             SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
             SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
             DataCopyPad(curValueIdxUb[valueOffset], vec1ResGm[wsOffset],
-                        {1, static_cast<uint16_t>(2 * BASE_TOPK * sizeof(int32_t)), 0, 0}, {true, 0, 0, 0});
+                        {1, static_cast<uint16_t>(2 * BASE_TOPK * sizeof(int32_t)), 0, 0, 0}, {true, 0, 0, 0});
             valueOffset += 2 * BASE_TOPK;
             acc_list_num++;
 
@@ -644,7 +949,9 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessLD()
             PipeBarrier<PIPE_V>();
         }
 
-        // 搬出
+        // 搬出(生产 lightning_indexer ProcessLD returnValue=false 同款):
+        //   Extract 分离 (value,index) → 直拷 idx(列号)。coarse 无 candidates 掩码,
+        //   位置 ≥ actS2Size 由 Duplicate(NEG_INF) 预填沉底, 尾部空槽 = InitSortOutBuf 的 -1。
         LocalTensor<float> outValueUb = ldOutValueBuf_.Get<float>();
         LocalTensor<uint32_t> outIdxUb = ldOutIdxBuf_.Get<uint32_t>();
         Extract(outValueUb, outIdxUb, curValueIdxUb, (BASE_TOPK / 32));

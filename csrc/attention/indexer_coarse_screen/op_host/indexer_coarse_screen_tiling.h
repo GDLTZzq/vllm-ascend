@@ -1,12 +1,12 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 /*!
  * \file indexer_coarse_screen_tiling.h
@@ -43,13 +43,14 @@ enum class DataLayout : uint32_t {
 };
 
 // ------------------算子原型索引常量定义----------------
-// Inputs Index(与 kernel 形参顺序一致: query,key,weights,actual_seq_q,actual_seq_k,block_table)
+// Inputs Index(与 kernel 形参顺序一致: query,key,weights,row_weights,actual_seq_q,actual_seq_k,block_table)
 constexpr uint32_t QUERY_INDEX = 0;
 constexpr uint32_t KEY_INDEX = 1;
 constexpr uint32_t WEIGTHS_INDEX = 2;
-constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 3;
-constexpr uint32_t ACTUAL_SEQ_K_INDEX = 4;
-constexpr uint32_t BLOCK_TABLE_INDEX = 5;
+constexpr uint32_t ROW_WEIGHTS_INDEX = 3;
+constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 4;
+constexpr uint32_t ACTUAL_SEQ_K_INDEX = 5;
+constexpr uint32_t BLOCK_TABLE_INDEX = 6;
 //Outputs Index
 constexpr uint32_t INDEXER_COARSE_SCREEN = 0;
 // Attributes Index
@@ -65,16 +66,26 @@ constexpr uint32_t DIM_NUM_TWO = 2;
 constexpr uint32_t DIM_NUM_THREE = 3;
 constexpr uint32_t DIM_NUM_FOUR = 4;
 // 入参限制常量
+constexpr uint32_t QUERY_HEAD_NUM_LIMIT = 64;   // N1(head 数)上限, 镜像 indexer_refine
 constexpr uint32_t HEAD_DIM_LIMIT = 128;
-constexpr uint32_t QUERY_HEAD_NUM_LIMIT = 64;
-constexpr uint32_t COARSE_COUNT = 4096;          // 候选集宽度(coarse_screen 输出 topk 宽度)
+constexpr uint32_t SPARSE_LIMIT = 8192;          // coarseCount 上限(coarse_screen topk 宽度 ≤ 8192)
+constexpr uint32_t COARSE_COUNT = 4096;          // 候选集宽度(PIVOT 融合路径固定值, topk 累加器/输出粗筛宽)
+constexpr uint32_t MAX_GROUP = 16;               // group 宽 g 上界(镜像 python _MAX_GROUP)
+
+// 8 元素对齐(输出行宽,规避 CopyOut/Duplicate/SetValue 的对齐限制)
+inline uint32_t AlignUpTo8(uint32_t x)
+{
+    return (x + 7U) & ~7U;
+}
 
 // -----------算子TilingData定义---------------
 // 字段语义(与 kernel InitTilingData 一一对应):
-//   bSize=R(batchSize)  gSize=H(query head num)  s1Size=TND 总 query 行(非 BSND 场景不用)
-//   s2Size=PA key cache 可容纳的总 token 数(maxBlockNumPerBatch*blockSize)
-//   sparseCount=coarseCount(输出 topk 宽度,恒 4096)
-//   blockSize=PA block 大小   maxBlockNumPerBatch=block_table 宽
+//   bSize=R(batchSize=请求数)  gSize=H(query head num,Stage-2 加权归约用)
+//   s1Size=TND 总 query 行(N=g 个 decode 头行/请求,pooling 用)
+//   s2Size=maxBlockNumPerBatch*blockSize(全前缀上界,非候选集宽度)
+//   sparseCount=coarseCount(topk 累加器宽度,输出 topk 宽;PIVOT 下恒 4096)
+//   gMax=row_weights.dim1(池化 group 宽 g,域 [0,L) 收缩用)  outRowWidth=Align8(sparseCount+gMax)(输出行宽)
+//   blockSize=PA block 大小   maxBlockNumPerBatch=block_table 宽(全前缀 gather 用)
 BEGIN_TILING_DATA_DEF(IndexerCoarseScreenTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
 TILING_DATA_FIELD_DEF(uint32_t, gSize)
@@ -84,6 +95,8 @@ TILING_DATA_FIELD_DEF(uint32_t, sparseCount)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
 TILING_DATA_FIELD_DEF(uint32_t, blockSize)
 TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
+TILING_DATA_FIELD_DEF(uint32_t, gMax)
+TILING_DATA_FIELD_DEF(uint32_t, outRowWidth)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(IndexerCoarseScreen, IndexerCoarseScreenTilingData)
 
@@ -95,6 +108,7 @@ struct LiParaInfo {
     TilingRequiredParaInfo query = {nullptr, nullptr};
     TilingRequiredParaInfo key = {nullptr, nullptr};
     TilingRequiredParaInfo weights = {nullptr, nullptr};
+    TilingRequiredParaInfo rowWeights = {nullptr, nullptr};
     TilingOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
     TilingOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
     TilingOptionalParaInfo blockTable = {nullptr, nullptr};
@@ -115,14 +129,16 @@ public:
     platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
     uint32_t bSize = 0;
     uint32_t s1Size = 0;
-    int64_t s2Size = 0; // PA key cache 总 token 容量
+    int64_t s2Size = 0; // maxBlockNumPerBatch*blockSize(全前缀上界)
     uint32_t gSize = 0; // H(query head num)
-    // PageAttention(stage-0 gather 用)
+    // PageAttention(全前缀 gather 用)
     bool pageAttentionFlag = false;
     int32_t blockSize = 0;
     uint32_t maxBlockNumPerBatch = 0;
     // Others Flag
-    uint32_t sparseCount = 0; // coarseCount(输出 topk 宽度)
+    uint32_t sparseCount = 0; // coarseCount(输出 topk 宽度, PIVOT 下恒 4096)
+    uint32_t gMax = 0;        // row_weights.dim1,池化 group 宽 g(域 [0,L) 收缩用)
+    uint32_t outRowWidth = 0; // 输出单行宽 = Align8(sparseCount + gMax)
     // DType
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKType = ge::DT_FLOAT16;
@@ -191,6 +207,10 @@ public:
     // PageAttention
     uint32_t maxBlockNumPerBatch_ = 0;
     int32_t blockSize_ = 0;
+    // Others Flag
+    uint32_t sparseCount_ = 0; // coarseCount(输出 topk 宽度)
+    uint32_t gMax_ = 0;        // row_weights.dim1,池化 group 宽 g(域 [0,L) 收缩用)
+    uint32_t outRowWidth_ = 0; // 输出单行宽 = Align8(sparseCount_ + gMax_)
     platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
     ge::DataType inputQType_ = ge::DT_FLOAT16;
     ge::DataType inputKType_ = ge::DT_FLOAT16;
