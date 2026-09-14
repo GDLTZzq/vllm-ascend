@@ -23,6 +23,14 @@
 #include "../indexer_coarse_screen_common.h"
 #include "indexer_coarse_screen_vector.h"
 
+// 诊断开关(默认 0,不改行为):置 1 时 CopyOutCoarseRow 把排序输出 globalTopkUb_ 的
+//   「值」半段(float 位模式)写进出参行的粗筛位置,供 probe_coarse_screen_values.py 判读
+//   算子自己的分数在输出顺序里是否单调递减 —— 用来区分「排序键错了」和「输出装配读错区」。
+//   仅定位用:出参内容会被替换成 float 位模式,勿带此开关出包。
+#ifndef COARSE_SCREEN_DUMP_VALUES
+#define COARSE_SCREEN_DUMP_VALUES 0
+#endif
+
 namespace LIKernel {
 using namespace IndexerCoarseScreenCommon;
 using namespace IndexerCoarseScreenServiceVec;
@@ -328,8 +336,16 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CopyOutCoarseRow(i
         idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
         // dst 起点 / copyLen 恒 32B 对齐(chunk 边界 = copyLen 倍数),take 不足时后续块必跳过。
         // 尾部(含 Adds 末块可能触及的 [coarseCnt, align8))随后被自有段/pad 整段重写,无残留。
+#if COARSE_SCREEN_DUMP_VALUES
+        // 诊断:Extract 已把 pairs 拆成 outValueUb[0,offset)=值、outValueUb[offset,2offset)=索引;
+        //   这里改写「值」半段(float 位模式),看算子自己给出的分数序列是否单调不增。
+        LocalTensor<float> rowF = rowUb.template ReinterpretCast<float>();
+        Adds(rowF[written], outValueUb, 0.0f, static_cast<int32_t>(take));
+        (void)idxULocal1;
+#else
         LocalTensor<int32_t> coarseDst = rowUb[written];
         Adds(coarseDst, idxULocal1, static_cast<int32_t>(0), static_cast<int32_t>(take));
+#endif
         PipeBarrier<PIPE_V>();
         outQueue_.FreeTensor(outValueUb);
         written += static_cast<int32_t>(take);
