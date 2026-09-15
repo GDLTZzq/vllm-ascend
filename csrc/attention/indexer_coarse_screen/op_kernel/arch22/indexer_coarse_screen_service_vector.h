@@ -23,10 +23,13 @@
 #include "../indexer_coarse_screen_common.h"
 #include "indexer_coarse_screen_vector.h"
 
-// 诊断开关(默认 0,不改行为):置 1 时 CopyOutCoarseRow 把排序输出 globalTopkUb_ 的
-//   「值」半段(float 位模式)写进出参行的粗筛位置,供 probe_coarse_screen_values.py 判读
-//   算子自己的分数在输出顺序里是否单调递减 —— 用来区分「排序键错了」和「输出装配读错区」。
-//   仅定位用:出参内容会被替换成 float 位模式,勿带此开关出包。
+// 诊断开关(默认 0,不改行为):置 1 时 CopyOutCoarseRow 把排序累加器 globalTopkUb_ 的
+//   原始 (value,index) 交错对整段拷进出行首段 —— 偶词 = 该位次的分数(float 位模式),
+//   奇词 = 同一位次的索引。probe_coarse_screen_values.py 据此一次判读三件事:
+//   (a) 分数是否随位次单调不增(排序是否真的按分数排);
+//   (b) value 是否等于同位置 index 的真实分数(配对是否保持 → 区分「排序空转」与「键退化」);
+//   (c) index 序列是原序/逆序/分块(定位是哪一个环节把顺序打乱)。
+//   仅定位用:出参内容会被替换成原始对,勿带此开关出包。
 #ifndef COARSE_SCREEN_DUMP_VALUES
 #define COARSE_SCREEN_DUMP_VALUES 0
 #endif
@@ -337,10 +340,12 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CopyOutCoarseRow(i
         // dst 起点 / copyLen 恒 32B 对齐(chunk 边界 = copyLen 倍数),take 不足时后续块必跳过。
         // 尾部(含 Adds 末块可能触及的 [coarseCnt, align8))随后被自有段/pad 整段重写,无残留。
 #if COARSE_SCREEN_DUMP_VALUES
-        // 诊断:Extract 已把 pairs 拆成 outValueUb[0,offset)=值、outValueUb[offset,2offset)=索引;
-        //   这里改写「值」半段(float 位模式),看算子自己给出的分数序列是否单调不增。
+        // 诊断:整段搬累加器的原始 (value,index) 交错对(不走 Extract 拆半段),偶词=该位次的
+        //   分数(float 位模式)、奇词=同位次索引 —— 保住配对关系,probe 才能区分
+        //   「排序空转」与「键退化/装配错读」。take 个词 = take/2 个对。
+        LocalTensor<float> coarseSrc = globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset];
         LocalTensor<float> rowF = rowUb.template ReinterpretCast<float>();
-        Adds(rowF[written], outValueUb, 0.0f, static_cast<int32_t>(take));
+        Adds(rowF[written], coarseSrc, 0.0f, static_cast<int32_t>(take));
         (void)idxULocal1;
 #else
         LocalTensor<int32_t> coarseDst = rowUb[written];
