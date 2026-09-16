@@ -168,7 +168,7 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
     OP_CHECK_IF(((*opParamInfo_.sparseCount > 2048) && (*opParamInfo_.sparseCount % 1024 != 0)),
                OP_LOGE(opName_, "when sparse_count > 2048, sparse_count must be an integer multiple of 1024."),
                return ge::GRAPH_FAILED);
-    // PIVOT 粗筛路径: 粗筛 topk 宽固定 = COARSE_COUNT(4096), 输出单行宽 = Align8(sparse_count+g)
+    // PIVOT 粗筛路径: 粗筛 topk 宽固定 = COARSE_COUNT(4096), 输出单行宽 = Align8(sparse_count + 2*g − 1)
     // (见 ValidateInputShapesMatch), 需单 block 内全前缀累加的 2k 拓扑, 其它取值不支持.
     OP_CHECK_IF((*opParamInfo_.sparseCount != static_cast<int32_t>(COARSE_COUNT)),
                OP_LOGE(opName_, "PIVOT fused coarse_screen: attr sparse_count must be exactly %u.",
@@ -269,10 +269,6 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckOptionalInput()
                opParamInfo_.actualSeqLengths.desc->GetDataType() != ge::DT_INT32,
                    OP_LOGE(opName_, "input actual_seq_lengths_key data type only support int32"),
                    return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.actualSeqLengths.tensor != nullptr &&
-                   opParamInfo_.actualSeqLengths.desc->GetDataType() != ge::DT_INT32,
-               OP_LOGE(opName_, "input actual_seq_lengths_key data type only support int32"),
-               return ge::GRAPH_FAILED);
     if (qLayout_ == DataLayout::TND) {
         OP_CHECK_IF(opParamInfo_.actualSeqLengthsQ.tensor == nullptr,
                    OP_LOGE(opName_, "when layout_query is TND, input actual_seq_lengths_query must not be null"),
@@ -518,12 +514,13 @@ ge::graphStatus IndexerCoarseScreenInfoParser::ValidateInputShapesMatch()
                    MAX_GROUP, gMax_),
                return ge::GRAPH_FAILED);
     sparseCount_ = static_cast<uint32_t>(*opParamInfo_.sparseCount);
-    // 输出单行宽 = Align8(粗筛 topk 宽 + 池化组宽 g):行 = 粗筛 top-min(L,4096) + 自有 g token + -1 pad
-    outRowWidth_ = AlignUpTo8(sparseCount_ + gMax_);
-    // -----------------------check 输出单行宽(恒 = Align8(sparse_count + g))-------------------
+    // 输出单行宽 = Align8(sparse_count + 2*gMax − 1):行 = 排名 top-min(lo,4096) + 行尾
+    // 「组窗口∪自有」段(宽 ≤ 2*g − 1)+ -1 pad。
+    outRowWidth_ = AlignUpTo8(sparseCount_ + 2 * gMax_ - 1);
+    // -----------------------check 输出单行宽(恒 = Align8(sparse_count + 2*g − 1))-------------------
     OP_CHECK_IF((static_cast<uint32_t>(opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO)) != outRowWidth_),
                OP_LOGE(opName_,
-                   "output sparse_indices shape last dim must be Align8(sparse_count + g),"
+                   "output sparse_indices shape last dim must be Align8(sparse_count + 2*g - 1),"
                        "but now they are %u, %ld respectively.", outRowWidth_,
                        opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO)),
                return ge::GRAPH_FAILED);

@@ -61,9 +61,10 @@ at::Tensor construct_indexer_coarse_screen_output_tensor(
     TORCH_CHECK(actual_seq_lengths_query.has_value(),
                 "actual_seq_lengths_query must be provided for TND coarse_screen.");
     int64_t batchSize = actual_seq_lengths_query->size(DIM_0);
-    // 输出单行宽 = Align8(粗筛 topk 宽 + 池化组宽 g):行 = 粗筛 top-min(L,4096) + 自有 g token + -1 pad
+    // 输出单行宽 = Align8(sparse_count + 2*g − 1):行 = 排名 top-min(lo,4096) + 行尾
+    // 「组窗口∪自有」段(宽 ≤ 2*g − 1)+ -1 pad
     int64_t g = row_weights.size(DIM_1);
-    int64_t outRowWidth = (sparse_count + g + ALIGN_8 - 1) / ALIGN_8 * ALIGN_8;
+    int64_t outRowWidth = (sparse_count + 2 * g - 1 + ALIGN_8 - 1) / ALIGN_8 * ALIGN_8;
     output_size = {batchSize, key.size(DIM_2), outRowWidth};
 
     return at::empty(output_size, query.options().dtype(at::kInt));

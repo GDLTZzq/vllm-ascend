@@ -46,8 +46,8 @@ struct RunInfo {
     uint32_t s2Idx;
 
     uint32_t actS1Size = 1;
-    uint32_t actS2Size = 1;        // 粗筛域长 L(自有 token 不入池)
-    uint32_t actS2NaturalLen = 1;  // 自然 KV 长度 aslk(= L + g_r):行尾自有 token [L,L+g_r) 的上界
+    uint32_t actS2Size = 1;        // 粗筛排名域长 lo = max(0, aslk − 2·g_r + 1)
+    uint32_t actS2NaturalLen = 1;  // 自然 KV 长度 aslk(= L + g_r):行尾「组窗口∪自有」段 [lo, aslk) 上界
     uint32_t actMBaseSize;
     uint32_t actualSingleProcessSInnerSize;
     uint32_t actualSingleProcessSInnerSizeAlign;
@@ -56,21 +56,14 @@ struct RunInfo {
     uint64_t tensorKeyOffset;
     uint64_t tensorWeightsOffset;
     uint64_t indiceOutOffset;
-    uint64_t valueOutOffset;
 
     bool isFirstS2InnerLoop;
     bool isLastS2InnerLoop;
-    bool isAllLoopEnd = false;
-    bool isValid = false;
 };
 
 struct ConstInfo {
     // CUBE与VEC核间同步的模式
     static constexpr uint32_t FIA_SYNC_MODE2 = 2;
-    static constexpr uint32_t QLI_SYNC_MODE4 = 4;
-    static constexpr uint32_t AIV0_AIV1_OFFSET = 16;
-    static constexpr uint32_t CROSS_VC_EVENT = 0;
-    static constexpr uint32_t CROSS_CV_EVENT = 2;
     // BUFFER的字节数
     static constexpr uint32_t BUFFER_SIZE_BYTE_32B = 32;
     static constexpr uint32_t BUFFER_SIZE_BYTE_64B = 64;
@@ -84,12 +77,9 @@ struct ConstInfo {
     static constexpr uint32_t BUFFER_SIZE_BYTE_32K = 32768;
     // 无效索引
     static constexpr int INVALID_IDX = -1;
-    uint16_t INVALID_VAL = 0;
     // CUBE和VEC的核间同步EventID
     uint32_t syncC1V1 = 0U;
-    uint32_t syncC1V0 = 2U;
     uint32_t syncV1C1 = 0U;
-    uint32_t syncV0C1 = 1U;
 
     // 基本块大小
     uint32_t mBaseSize = 1ULL;
@@ -121,9 +111,6 @@ struct ConstInfo {
     bool isAccumSeqS1 = false;    // 是否累加模式
     bool isAccumSeqS2 = false;    // 是否累加模式
     bool isSparseCountOver2K = false; //sparseCount小于等于2048为false
-    bool isLDOpen = false;
-    bool returnValueFlag = false;
-    bool splitMFlag = false;
 };
 
 struct SplitCoreInfo {

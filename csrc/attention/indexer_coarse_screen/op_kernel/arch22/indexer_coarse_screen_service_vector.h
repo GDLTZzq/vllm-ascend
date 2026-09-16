@@ -85,11 +85,11 @@ public:
                                                 GlobalTensor<W_T> wBarGm, GlobalTensor<uint32_t> actualSeqLengthsGmQ);
     __aicore__ inline void PreprocessMean(uint32_t bStart, uint32_t bEnd);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
-    // 输出一整行 = [粗筛 top-min(L,sparseCount) 的索引][自有 token L..L+gR-1][-1 pad],
-    // 行宽 = outRowWidth = Align8(sparseCount + gMax)。coarseCnt==0 时不读 topk 源(L==0 首
-    // token 请求:整行 = [0,ownCount) 自有 token + pad)。
+    // 输出一整行 = [排名 top-min(lo,sparseCount) 的索引][行尾「组窗口∪自有」段
+    // [tailStart,tailStart+tailCount)][-1 pad],行宽 = outRowWidth = Align8(sparseCount + 2*gMax − 1)。
+    // coarseCnt==0 时不读 topk 源(lo==0:整行 = [0,tailCount) + pad)。
     __aicore__ inline void CopyOutCoarseRow(int64_t gmRowOffset, int32_t innerS1Idx, uint32_t coarseCnt,
-                                           uint32_t ownStart, uint32_t ownCount);
+                                           uint32_t tailStart, uint32_t tailCount);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void InitLDBuffers(TPipe *pipe);
@@ -298,21 +298,23 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CleanInvalidOutput
     outQueue_.FreeTensor(valueULocal);
 }
 
-// A1 修订:输出行 = [粗筛 top-min(L,sparseCount)][自有 token L..L+gR-1][-1 pad]。
-//   * 粗筛段:Extract 分离 globalTopkUb_ 的 (value,index) 交错对取索引。over2k(4096) 下
+// 输出行 = [排名 top-min(lo,sparseCount)][行尾「组窗口∪自有」段 [lo, aslk)][-1 pad]。
+//   * 排名段:Extract 分离 globalTopkUb_ 的 (value,index) 交错对取索引。over2k(4096) 下
 //     globalTopkUb_[innerS1Idx*virTopK*2] 起 2*virTopK floats = acc_U++acc_L 拼接 = 完整
-//     top-4096 对(offset=virTopK,copyNum=1);>4K 分两块依次拼接。有效前缀数 = min(L,sparseCount),
+//     top-4096 对(offset=virTopK,copyNum=1);>4K 分两块依次拼接。有效前缀数 = min(lo,sparseCount),
 //     其尾段在 InitSortOutBuf 已置 -1,故只取前 coarseCnt 个。
-//   * 自有段:[L, L+gR) 升序 gR 个(域 [0,L) 已排除自有 token,无重复)。L==0 时 coarseCnt=0、
-//     ownStart=0、ownCount=aslk,整行 = [0,aslk) + pad。
+//   * 行尾段:[lo, aslk) 升序 aslk−lo 个。它是本步 refine 域里被显式并入的那部分 —— 组窗口
+//     [lo, L+gR) 并上自有 token(= 窗口的右半 [L, L+gR))。lo = aslk − 2·gR + 1 ⇒ 该段与排名段
+//     [0, lo) 不相交,故直接升序追加即为并集,无需去重。lo==0 时 coarseCnt=0、tailStart=0、
+//     tailCount=aslk,整行 = [0,aslk) + pad。
 //   * pad:标量补至 8 元素对齐,再 Duplicate(-1) 批量到 outRowWidth(对齐由调用方保证)。
 //   * 行缓冲借用 tmpUb_ 前段:此时本请求的归并 scratch 已用完(见 ProcessVec 归并段)。
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CopyOutCoarseRow(int64_t gmRowOffset,
                                                                                int32_t innerS1Idx,
                                                                                uint32_t coarseCnt,
-                                                                               uint32_t ownStart,
-                                                                               uint32_t ownCount)
+                                                                               uint32_t tailStart,
+                                                                               uint32_t tailCount)
 {
     const int32_t rowWidth = static_cast<int32_t>(constInfo_.outRowWidth);
     int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? static_cast<int64_t>(virTopK)
@@ -356,11 +358,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CopyOutCoarseRow(i
         written += static_cast<int32_t>(take);
     }
 
-    // 自有 token 升序 [ownStart, ownStart+ownCount)(标量写,起点任意对齐)
-    for (uint32_t i = 0; i < ownCount; i++) {
-        rowUb.SetValue(written + static_cast<int32_t>(i), static_cast<int32_t>(ownStart + i));
+    // 行尾段升序 [tailStart, tailStart+tailCount)(标量写,起点任意对齐)
+    for (uint32_t i = 0; i < tailCount; i++) {
+        rowUb.SetValue(written + static_cast<int32_t>(i), static_cast<int32_t>(tailStart + i));
     }
-    written += static_cast<int32_t>(ownCount);
+    written += static_cast<int32_t>(tailCount);
 
     // -1 补齐:标量补到 8 元素对齐首(Duplicate 要求 32B 对齐),其余批量
     int32_t padStart = (written + 7) & ~7;
@@ -520,12 +522,13 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::PreprocessMean(uin
             for (int32_t chunk = 0; chunk < gR; chunk += PREPROCESS_ROWS_CHUNK) {
                 int32_t rows = (chunk + PREPROCESS_ROWS_CHUNK > gR) ? gR - chunk : PREPROCESS_ROWS_CHUNK;
                 // query[cumPrev+i, h, :],i∈[chunk,chunk+rows):行距 H*D,行宽 D
+                // srcStride 单位=**字节**(GM 侧):跨过一行(D 个元素)剩下的间隙
                 uint64_t srcOff = (static_cast<uint64_t>(cumPrev + chunk) * gSize + h) * headDim;
-                uint32_t srcStride =
-                    (static_cast<uint32_t>(gSize) * headDim - headDim) * sizeof(Q_T) / 32;
+                uint32_t srcStride = static_cast<uint32_t>(gSize) * headDim * sizeof(Q_T) -
+                                     static_cast<uint32_t>(headDim) * sizeof(Q_T);
                 AscendC::DataCopyPad(rowUbBf16, queryGm[srcOff],
                                      {static_cast<uint16_t>(rows), static_cast<uint16_t>(headDim * sizeof(Q_T)),
-                                      static_cast<uint16_t>(srcStride), 0, 0},
+                                      srcStride, 0, 0},
                                      pad);
                 AscendC::PipeBarrier<PIPE_ALL>(); // A1: Cast(V) 读 rowUbBf16
                 AscendC::Cast(rowUbF32, rowUbBf16, RoundMode::CAST_NONE, rows * headDim);
@@ -725,16 +728,17 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             bool needCopyWsGm = info.isLastS2InnerLoop;
 
             if (needCopyOutGm) {
-                // A1 修订:输出行 = [粗筛 top-min(L,sparseCount)][自有 token L..L+gR-1][-1 pad]。
-                //   粗筛有效前缀数 c = min(actS2Size=L, sparseCount);自有 token 数 gR = aslk − L
-                //   (aslk = 自然长度,域 [0,L) 已排除自有 token,故无重复)。
+                // 输出行 = [排名 top-min(lo,sparseCount)][行尾「组窗口∪自有」段 [lo, aslk)][-1 pad]。
+                //   排名有效前缀数 c = min(actS2Size=lo, sparseCount);行尾段 = [lo, aslk),
+                //   宽 aslk − lo(lo = aslk − 2·gR + 1 ⇒ 恒 2·gR − 1;lo==0 时 = aslk)。
+                //   窗口段 [lo, L+gR) 与排名段 [0, lo) 不相交,直接升序追加即并集,无需去重。
                 uint32_t coarseCnt = (info.actS2Size > static_cast<uint32_t>(constInfo_.sparseCount))
                                    ? static_cast<uint32_t>(constInfo_.sparseCount)
                                    : info.actS2Size;
-                uint32_t ownCount = (info.actS2NaturalLen > info.actS2Size)
-                                  ? (info.actS2NaturalLen - info.actS2Size) : 0U;
+                uint32_t tailCount = (info.actS2NaturalLen > info.actS2Size)
+                                   ? (info.actS2NaturalLen - info.actS2Size) : 0U;
                 CopyOutCoarseRow(info.indiceOutOffset + cuS1Idx * constInfo_.outRowWidth,
-                                 innerS1Idx, coarseCnt, info.actS2Size, ownCount);
+                                 innerS1Idx, coarseCnt, info.actS2Size, tailCount);
             } else if (needCopyWsGm) {
                 // vec1Res Gm = [aic, s1BaseSize_, 2, 2, topkOut_] float32
                 // vec1Param Gm = [aic, s1BaseSize_, 2, 16] int64

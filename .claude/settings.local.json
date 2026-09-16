@@ -14,7 +14,9 @@
       "Bash(sed -n '150,158p' csrc/build_aclnn.sh)",
       "Bash(bash -n csrc/build_aclnn.sh)",
       "Bash(sed -n '205,240p' setup.py)",
-      "Bash(sed -n '435,450p' setup.py)"
+      "Bash(sed -n '435,450p' setup.py)",
+      "Bash(pip show *)",
+      "Bash(awk length>120{print FILENAME\":\"FNR\": \"length} *)"
     ]
   }
 }

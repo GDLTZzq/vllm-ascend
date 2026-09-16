@@ -42,8 +42,8 @@ struct TempLoopInfo {
     uint32_t gS1LoopEnd = 0U;      // gS1方向循环的结束Idx
     uint32_t s2LoopEnd = 0U;       // S2方向循环的结束Idx
     uint32_t actS1Size = 1ULL;     // 当前Batch循环处理的S1轴的实际大小
-    uint32_t actS2Size = 0ULL;     // 粗筛域长 L(自有 token 不入池)
-    uint32_t actS2NaturalLen = 0U; // 自然 KV 长度 aslk(= L + g_r),行尾自有 token 上界
+    uint32_t actS2Size = 0ULL;     // 粗筛排名域长 lo = max(0, aslk − 2·g_r + 1)
+    uint32_t actS2NaturalLen = 0U; // 自然 KV 长度 aslk(= L + g_r),行尾「窗口∪自有」段上界
     bool curActSeqLenIsZero = false;
     bool needDealActS1LessThanS1 = false; // S1的实际长度小于shape的S1长度时，是否需要清理输出
     uint32_t actMBaseSize = 0U;    // m轴(gS1)方向实际大小
@@ -171,8 +171,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitTilingData(const Inde
     constInfo.kCacheBlockSize = tilingData->blockSize;
     constInfo.maxBlockNumPerBatch = tilingData->maxBlockNumPerBatch;
     constInfo.sparseCount = tilingData->sparseCount; // = coarse_count(输出 topk 宽度,4096)
-    constInfo.gMax = tilingData->gMax;               // 池化 group 宽 g = row_weights.dim1(域 [0,L) 收缩用)
-    constInfo.outRowWidth = tilingData->outRowWidth; // 输出单行宽 = Align8(sparseCount + gMax)
+    constInfo.gMax = tilingData->gMax;               // 池化 group 宽 g = row_weights.dim1(域 [0,lo) 收缩用)
+    constInfo.outRowWidth = tilingData->outRowWidth; // 输出单行宽 = Align8(sparseCount + 2*gMax − 1)
     constInfo.preTokens = INT64_MAX;
     constInfo.nextTokens = INT64_MAX;
     constInfo.returnValue = false;
@@ -242,9 +242,13 @@ template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::GetS1S2ActualSeqLen(uint32_t bIdx,
                                                              uint32_t &actS1Size, uint32_t &actS2Size)
 {
-    // coarse 融合语义(域 [0,L)):每请求 1 行代理(q_bar),S1 恒为 1。
-    // 组宽 g_r = aslq cum 差分(与 PreprocessMean 同取法);L = 自然长度(aslk) − g_r。
-    // S2 = 域长 L(非累加 PA_BSND):cube PA 读、子片数随 L 收缩,自有 token 永不入粗筛。
+    // coarse 融合语义(排名域 [0, lo)):每请求 1 行代理(q_bar),S1 恒为 1。
+    // 组宽 g_r = aslq cum 差分(与 PreprocessMean 同取法);自然长度 aslk = L + g_r。
+    // 本步 refine 域 = 池 ∪ 组窗口(论文 Appendix B,W = g):窗口 = g 个 query 行各自
+    //   [t-g+1, t] 的并 = [lo, aslk),lo = max(0, aslk − 2·g_r + 1)。ranked 粗筛只负责
+    //   窗口之前的 [0, lo) —— 窗口段与已排名段按构造互不相交,故 CopyOutCoarseRow 把
+    //   [lo, aslk) 原样升序并入即得并集,无需成员测试/去重。池仍不含自有 token(域 ⊂ [0, L))。
+    // S2 = 域长 lo(非累加 PA_BSND):cube PA 读、子片数随 lo 收缩,窗口段不入粗筛排名。
     actS1Size = 1;
     uint32_t seqLen =
         GetActualSeqLen(bIdx, constInfo.actualLenDims, constInfo.isAccumSeqS2, actualSeqLengthsGm, constInfo.kSeqSize);
@@ -256,7 +260,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::GetS1S2ActualSeqLen(uint3
             gR = cumDiff;
         }
     }
-    actS2Size = (seqLen > gR) ? (seqLen - gR) : 0;
+    actS2Size = (seqLen >= 2 * gR) ? (seqLen - 2 * gR + 1) : 0;
 }
 
 template <typename LIT>
@@ -392,16 +396,16 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::DealActSeqLenIsZero(uint3
 {
     if ASCEND_IS_AIV {
         if (constInfo.outputLayout == LI_LAYOUT::TND) {
-            // L==0(seq_lens<=g_r,域空):粗筛段为空,整行 = [0, aslk) 自有 token + -1 pad
-            // (A1 修订:自有 token 由 op 直接输出)。actS1Size 恒 1,每请求 1 行。
-            // aslk <= g_r <= gMax 已由 actS2Size==0 保证,仍夹紧防御越界。
-            uint32_t ownCount = tempLoopInfo.actS2NaturalLen;
-            ownCount = (ownCount > constInfo.gMax) ? constInfo.gMax : ownCount;
+            // 域 [0,lo) 为空 ⟺ aslk <= 2·g_r−1(不足一个完整组窗口):粗筛段为空,整行 =
+            // [0, aslk) 窗口∪自有 token + -1 pad(此时下界 lo=0)。actS1Size 恒 1,每请求 1 行。
+            uint32_t tailCount = tempLoopInfo.actS2NaturalLen;
+            const uint32_t tailMax = constInfo.gMax * 2 - 1; // 行内「窗口∪自有」段宽度上界
+            tailCount = (tailCount > tailMax) ? tailMax : tailCount;
             for (uint32_t s1Idx = s1Start; s1Idx < tempLoopInfo.actS1Size; s1Idx++) {
                 uint64_t indiceOutOffset =
                     (uint64_t)bIdx * constInfo.kHeadNum * constInfo.outRowWidth + // B轴(请求)偏移
                     (uint64_t)n2Idx * constInfo.outRowWidth;                      // N2轴偏移
-                vectorService.CopyOutCoarseRow(static_cast<int64_t>(indiceOutOffset), 0, 0U, 0U, ownCount);
+                vectorService.CopyOutCoarseRow(static_cast<int64_t>(indiceOutOffset), 0, 0U, 0U, tailCount);
             }
         } else if (constInfo.outputLayout == LI_LAYOUT::BSND) {
             for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
@@ -575,8 +579,6 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
 
     runInfo.isFirstS2InnerLoop = s2LoopIdx == splitCoreInfo.s2Start;
     runInfo.isLastS2InnerLoop = s2LoopIdx == tempLoopInfo.s2LoopEnd;
-    runInfo.isAllLoopEnd = (runInfo.bN2Idx == splitCoreInfo.bN2End) && (runInfo.gS1Idx == splitCoreInfo.gS1End) &&
-                           (runInfo.s2Idx == splitCoreInfo.s2End);
 
     if (runInfo.isFirstS2InnerLoop) {
         uint64_t actualSeqQPrefixSum;
@@ -596,7 +598,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
         // B,S1,N1(N2,G)
         // w_bar 行基址(步长 = 对齐16 的 gSize,w_bar 每请求 1 行 H 值)
         weightsCoreOffset = runInfo.bIdx * constInfo.gSizeAligned16;
-        // B,S1,N2,K(行宽 = outRowWidth = Align8(sparseCount+gMax),粗筛 top 索引 + 自有 g token + -1 pad)
+        // B,S1,N2,K(行宽 = outRowWidth,排名 top 索引 + 组窗口∪自有段 + -1 pad)
         indiceOutCoreOffset = (uint64_t)runInfo.bIdx * constInfo.kHeadNum * constInfo.outRowWidth +
                               (uint64_t)runInfo.n2Idx * constInfo.outRowWidth;
     }

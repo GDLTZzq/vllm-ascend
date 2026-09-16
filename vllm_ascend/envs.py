@@ -127,13 +127,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # tests/e2e/nightly/single_node/ops/singlecard_ops/test_indexer_coarse_screen.py.
     "VLLM_ASCEND_PIVOT_COARSE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_USE_OP", "0"))),
     # Per-query local window (paper Appendix B, decode variant) in the PIVOT
-    # refine DOMAIN: each decode step's pool (proxy top-4096 over [0, L), L =
-    # prefix before this step) is widened by the group's window union
-    # [L-g+1, L+g) -- the g own tokens plus the last g-1 prefix tokens -- and
-    # those entries COMPETE BY SCORE in the refine (paper semantics, not a
-    # forced reserve slot). Off = ablation / rollback switch; the lossless
-    # region (L+g <= 2048) still reproduces the native full prefix
-    # bit-identically either way.
+    # refine DOMAIN: each decode step's pool (proxy top-4096 over the ranked
+    # domain [0, lo), lo = max(0, seq_lens - 2g + 1) = the window's own lower
+    # bound, L = lo + g - 1 = prefix before this step) is widened by the
+    # group's window union [lo, aslk) -- the g own tokens plus the last g-1
+    # prefix tokens -- and those entries COMPETE BY SCORE in the refine (paper
+    # semantics, not a forced reserve slot). Off = ablation / rollback switch;
+    # the lossless region (L+g <= 2048) still reproduces the native full prefix
+    # bit-identically either way. NOTE: the npu_indexer_coarse_screen op always
+    # fuses the union (this switch governs only the torch paths) -- the op row
+    # already carries it, so the op path reads aslk off the row.
     "VLLM_ASCEND_PIVOT_LOCAL_WINDOW": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_LOCAL_WINDOW", "1"))),
     # Capture real PIVOT refine op inputs (+ the torch reference output) to
     # disk so the single-op replay harness (plans/indexer_refine_realdata_replay.py)

@@ -1,26 +1,51 @@
 """Single-op probe for npu_indexer_coarse_screen (PIVOT-Refine coarse screen).
 
-The op is npu_lightning_indexer restricted to sparse_count=4096 / sparse_mode=0:
-score[r, p] = sum_h w_bar[r, h] * relu(q_bar[r, h] . k[r, p]) over the whole PA
-prefix p in [0, L), top-sparse_count positions out, -1 padded.
+The op emits the WHOLE step-2 candidate row: the ranked coarse screen AND the
+verbatim group-window union, fused so python needs no `_inject_local_window`.
+
+For each request r with group width g (query rows [r*g, r*g+g)) and natural key
+prefix length aslk = actual_seq_lengths_key[r] = L + g, let
+
+    lo = max(0, aslk - 2g + 1)
+
+(the lower bound of the group's local window [L-g+1, L+g)). The op must produce
+ONE row of width Align8(sparse_count + 2g - 1) whose valid front is exactly
+
+    [ ranked top-min(lo, sparse_count) of the domain-[0, lo) proxy score ]
+    [ the window union [lo, aslk) verbatim, ascending ]
+    [ -1 pad to Align8(sparse_count + 2g - 1) ]
+
+so the valid COUNT == min(lo, sparse_count) + (aslk - lo). The two segments are
+disjoint by construction (lo IS the window's own lower bound), which is why the
+window needs no dedup and no membership test. Rows with aslk <= 2g-1 (first
+token) have lo == 0, an empty ranked segment, and are [0 .. aslk-1] + -1 pad:
+
+    score[r, p] = sum_h w_bar[r, h] * relu(q_bar[r, h] . k[r, p]), p in [0, lo)
+    q_bar/w_bar = the request's g-row mean proxy (row_weights all ones here =>
+    plain mean, byte-identical to python's q_bar/w_bar)
+
+Contract assumptions verified against the hosts/kernels:
+  - query TND [T=K*g, H, 128], g pooled rows per request;
+  - aslq is CUMULATIVE with step g ([g, 2g, .., K*g]) because LAYOUT_T == TND;
+  - aslk is NON-cumulative (K_LAYOUT_T == PA_BSND) and is the NATURAL length
+    L+g, not L: the op itself carves the ranked domain [0, lo) out of it;
+  - row_weights [K, g] bf16 == the pooling group width (tiling requires
+    rank-2 with last dim in (0, 16]);
+  - key PA_BSND [num_blocks, block_size, 1, 128], block_table [K, max_blocks];
+  - output [K, 1, Align8(4096 + 2g - 1)] int32, valid front + -1 pad; indices
+    are logical positions in [0, aslk), NOT cache slots (the kernel derives
+    slots from block_table).
 
 The reason this probe exists (rather than trusting the lightning_indexer
 lineage) is the `MrgSort4` mrgDstNum > 3072 branch in
 `indexer_coarse_screen_vector.h`, which splits a 4096-wide merge into
 2048/1024/1024(+512) queues. No other caller in this repo drives
 sparse_count=4096 (every lightning_indexer call site uses 2048/sparse_mode=3),
-so that path has zero coverage. The score-descending assertion below is what
-catches a width bug there: a truncated or mis-ordered merge still yields the
-right *set* (hence the set check alone is not enough) but the wrong order.
-
-Contract assumptions verified against the hosts/kernels:
-  - query TND [T=K, H, 128], 1 row per request;
-  - aslq is CUMULATIVE ([1..K]) because LAYOUT_T == TND;
-  - aslk is NON-cumulative (K_LAYOUT_T == PA_BSND) and must be L, the prefix
-    BEFORE the step's g tokens -- feeding L+g would add g candidates;
-  - key PA_BSND [num_blocks, block_size, 1, 128], block_table [K, max_blocks];
-  - output [K, 1, 4096] int32, -1 padded; indices are logical positions in
-    [0, L), NOT cache slots (the kernel derives slots from block_table).
+so that path has zero coverage. The score-descending assertion on the RANKED
+prefix below is what catches a width bug there: a truncated or mis-ordered
+merge still yields the right *set* (hence the set check alone is not enough)
+but the wrong order. The window tail is ordered by position instead, so it is
+asserted verbatim against [lo, aslk).
 """
 
 import os
@@ -29,7 +54,11 @@ import pytest
 import torch
 import torch_npu
 
-from vllm_ascend.attention.pivot_indexer import _COARSE_BUDGET, _coarse_screen
+from vllm_ascend.attention.pivot_indexer import (
+    _COARSE_BUDGET,
+    _coarse_screen,
+    _inject_local_window,
+)
 from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
@@ -46,35 +75,45 @@ DEVICE = f"npu:{DEVICE_ID}"
 
 torch_npu.npu.set_device(DEVICE_ID)
 
-# name -> per-request prefix lengths L (= aslk). One op call drives all K
-# requests, so the L list also exercises the per-request S2 loop bounds.
+
+def _row_width(g):
+    """The op's fixed per-row output width = Align8(sparse_count + 2g - 1)."""
+    return (_COARSE_BUDGET + 2 * g - 1 + 7) & ~7
+
+
+# (name, per-request natural prefix lengths aslk, group width g). One op call
+# drives all K requests, so the aslk list also exercises the per-request S2
+# loop bounds. aslk >= g always holds (a request has g query rows).
 CASES = [
-    ("tiny", [64, 128, 300, 512]),  # L << budget: whole prefix returned, -1 pad
-    ("block_aligned", [1024, 1025, 2048, 4095]),  # straddles 512-chunk bounds
-    ("truncated", [4096, 4097, 5000, 8192]),  # L > budget: real top-4096 pick
-    ("long", [65536, 30000, 12345, 4096]),  # deep S2 walk on one core
+    # lo == 0 (aslk <= 2g-1) mixed with tiny lo: ranked segment empty / 1-wide.
+    ("first_token", [4, 8, 12, 300], 4),
+    # lo < budget: the whole ranked domain is recalled, -1 pad after the tail.
+    ("short", [64, 128, 300, 512], 4),
+    ("block_aligned", [1024, 1025, 2048, 4095], 4),
+    # lo > budget: a real top-4096 pick out of the domain [0, lo).
+    ("truncated", [4096, 4097, 5000, 8192], 4),
+    ("long", [65536, 30000, 12345, 4096], 4),
+    # widest local window (2g-1 = 31) at the host's max group.
+    ("g16", [4600, 400, 16], 16),
 ]
 
 
-def _proxy_scores(q_bar, w_bar, k_cache, block_table, block_size, seq_lens):
-    """fp32 torch replica of the op's score, [K, L_max], -inf beyond L.
+def _proxy_scores(q_bar, w_bar, k_cache, block_table, block_size, n_pos):
+    """fp32 torch replica of the op's score over key positions [0, n_pos).
 
     Only used to score the op's returned positions and to derive the expected
-    top-k order; correctness of the reference itself comes from _coarse_screen.
+    ranked order; correctness of the reference itself comes from _coarse_screen.
     """
     k_dim = q_bar.shape[0]
-    l_max = int(seq_lens.max())
     kc = k_cache.reshape(-1, k_cache.shape[-1]).float()
-    pos = torch.arange(l_max, dtype=torch.int64)
+    pos = torch.arange(n_pos, dtype=torch.int64)
     slots = block_table[:, pos // block_size] * block_size + pos % block_size
-    k_all = kc[slots.reshape(-1)].view(k_dim, l_max, -1)
+    k_all = kc[slots.reshape(-1)].view(k_dim, n_pos, -1)
     att = torch.relu(torch.bmm(q_bar.float(), k_all.transpose(1, 2)))
-    score = (att * w_bar.float().unsqueeze(-1)).sum(dim=1)
-    beyond = pos.unsqueeze(0) >= seq_lens.to(torch.int64).unsqueeze(1)
-    return score.masked_fill(beyond, float("-inf"))
+    return (att * w_bar.float().unsqueeze(-1)).sum(dim=1)
 
 
-def _build_data(seq_lens, seed=0):
+def _build_data(seq_lens, g, seed=0):
     torch.manual_seed(seed)
     k = len(seq_lens)
     blocks_per_req = [(int(length) + BLOCK - 1) // BLOCK for length in seq_lens]
@@ -88,56 +127,82 @@ def _build_data(seq_lens, seed=0):
         block_table[r, :nb] = torch.arange(nxt, nxt + nb, dtype=torch.int32)
         nxt += nb
 
-    q_bar = torch.randn(k, H, DH).to(torch.bfloat16)
-    w_bar = torch.randn(k, H).to(torch.bfloat16)
+    q = torch.randn(k * g, H, DH).to(torch.bfloat16)
+    w = torch.randn(k * g, H).to(torch.bfloat16)
     k_cache = torch.randn(nxt, BLOCK, 1, DH).to(torch.bfloat16)
     seq = torch.tensor([int(length) for length in seq_lens], dtype=torch.int32)
-    return q_bar, w_bar, k_cache, block_table, seq
+    # row_weights all ones => the kernel's weighted mean == python's .mean(dim=1)
+    row_weights = torch.ones(k, g).to(torch.bfloat16)
+    return q, w, k_cache, block_table, seq, row_weights
+
+
+def _mean_proxies(q, w, k, g):
+    """Pool the g query rows per request in fp32 (mirrors the kernel's cast-
+    accumulate-cast mean), so the reference proxies match the op's byte-wise."""
+    q_bar = q.float().view(k, g, H, DH).mean(dim=1).to(torch.bfloat16)
+    w_bar = w.float().view(k, g, H).mean(dim=1).to(torch.bfloat16)
+    return q_bar, w_bar
 
 
 @pytest.mark.parametrize(
-    "seq_lens", [case[1] for case in CASES], ids=[case[0] for case in CASES]
+    "seq_lens,g", [(case[1], case[2]) for case in CASES], ids=[case[0] for case in CASES]
 )
-def test_indexer_coarse_screen_matches_torch_reference(seq_lens):
-    q_bar, w_bar, k_cache, block_table, seq = _build_data(seq_lens)
+def test_indexer_coarse_screen_matches_torch_reference(seq_lens, g):
+    q, w, k_cache, block_table, seq, row_weights = _build_data(seq_lens, g)
     k = len(seq_lens)
+    width = _row_width(g)
 
     # ---- reference: the production torch path, on CPU -------------------
-    score = _proxy_scores(q_bar, w_bar, k_cache, block_table, BLOCK, seq)
-    ref = _coarse_screen(
-        q_bar, w_bar, (None, None, k_cache), block_table, BLOCK, seq
+    q_bar, w_bar = _mean_proxies(q, w, k, g)
+    aslk = seq.to(torch.int64)
+    lo = (aslk - 2 * g + 1).clamp(min=0)  # ranked domain [0, lo)
+    ref, ref_aslk = _inject_local_window(
+        _coarse_screen(q_bar, w_bar, (None, None, k_cache), block_table, BLOCK, lo),
+        aslk,
+        g,
     )
-    assert tuple(ref.shape) == (k, _COARSE_BUDGET)
+    assert tuple(ref.shape)[0] == k
+    # The reference row is compact: its valid count is the refine op's aslk bound.
+    assert ((ref >= 0).sum(dim=1).to(torch.int64) == ref_aslk.to(torch.int64)).all()
 
     # ---- op ------------------------------------------------------------
     dev = torch.device(DEVICE)
     out = torch.ops._C_ascend.npu_indexer_coarse_screen(
-        q_bar.to(dev).contiguous(),
+        q.to(dev).contiguous(),
         k_cache.to(dev).contiguous(),
-        w_bar.to(dev).contiguous(),  # [K, H] bf16, same dtype as query/key
-        actual_seq_lengths_query=torch.arange(1, k + 1, dtype=torch.int32, device=dev),
+        w.to(dev).contiguous(),  # [K*g, H] bf16, same dtype as query/key
+        row_weights.to(dev).contiguous(),
+        actual_seq_lengths_query=torch.arange(
+            g, k * g + 1, g, dtype=torch.int32, device=dev
+        ),
         actual_seq_lengths_key=seq.to(dev),
         block_table=block_table.to(dev),
         layout_query="TND",
         layout_key="PA_BSND",
         sparse_count=_COARSE_BUDGET,
     )
-    assert tuple(out.shape) == (k, 1, _COARSE_BUDGET), out.shape
+    assert tuple(out.shape) == (k, 1, width), out.shape
     assert out.dtype == torch.int32, out.dtype
-    cols = out.cpu().view(k, _COARSE_BUDGET).to(torch.int64)
+    cols = out.cpu().view(k, width).to(torch.int64)
+
+    # Score the whole natural prefix once; both segments index into it.
+    score = _proxy_scores(q_bar, w_bar, k_cache, block_table, BLOCK, int(aslk.max()))
 
     for r, length in enumerate(seq_lens):
         length = int(length)
+        lo_r = int(lo[r])
+        n_ranked = min(lo_r, _COARSE_BUDGET)
         row = cols[r]
         # Anything negative must be the -1 pad, never uninitialised garbage.
         assert (row[row < 0] == -1).all(), f"row {r} padding is not -1"
 
         pos_op = row[row >= 0]
         pos_ref = ref[r][ref[r] >= 0]
-        expect = min(length, _COARSE_BUDGET)
+        expect = n_ranked + (length - lo_r)
 
         assert pos_op.numel() == expect, (
-            f"row {r}: op returned {pos_op.numel()} valid positions, expected {expect}"
+            f"row {r}: op returned {pos_op.numel()} valid positions, expected "
+            f"min(lo={lo_r}, {_COARSE_BUDGET}) + (aslk={length} - lo) = {expect}"
         )
         # Duplicates would silently shrink the candidate superset.
         assert pos_op.unique().numel() == pos_op.numel(), f"row {r} has duplicates"
@@ -147,29 +212,43 @@ def test_indexer_coarse_screen_matches_torch_reference(seq_lens):
             f"{sorted(set(pos_op.tolist()) ^ set(pos_ref.tolist()))[:16]}"
         )
 
-        # ---- order: catches the 4096-wide MrgSort branch -----------------
-        row_score = score[r]
-        op_scores = row_score[pos_op]
-        scale = max(1.0, float(op_scores.abs().max()))
-        diffs = op_scores[:-1] - op_scores[1:]
-        assert (diffs >= -1e-2 * scale).all(), (
-            f"row {r}: op output is not score-descending "
-            f"(worst inversion {float(-diffs.min()):.4g} at "
-            f"{int(diffs.argmin())})"
+        # ---- order -------------------------------------------------------
+        # Tail: the verbatim window union [lo, aslk), ascending by position.
+        assert pos_op[n_ranked:].tolist() == list(range(lo_r, length)), (
+            f"row {r}: window tail is not the verbatim union [{lo_r}, {length})"
         )
-        ref_top = torch.topk(row_score, expect, dim=-1).values
-        torch.testing.assert_close(op_scores, ref_top, rtol=1e-2, atol=1e-2)
+        # Ranked prefix: top-min(lo, budget) of the domain [0, lo), score-
+        # descending -- this is what catches the 4096-wide MrgSort branch. The
+        # value comparison (not index) keeps it tie-safe. Empty when lo == 0
+        # (first-token rows), where the row is the window tail alone.
+        if n_ranked:
+            op_ranked = pos_op[:n_ranked]
+            dom_score = score[r][:lo_r]
+            op_scores = dom_score[op_ranked]
+            scale = max(1.0, float(op_scores.abs().max()))
+            diffs = op_scores[:-1] - op_scores[1:]
+            assert (diffs >= -1e-2 * scale).all(), (
+                f"row {r}: ranked prefix is not score-descending "
+                f"(worst inversion {float(-diffs.min()):.4g} at {int(diffs.argmin())})"
+            )
+            torch.testing.assert_close(
+                op_scores, torch.topk(dom_score, n_ranked).values, rtol=1e-2, atol=1e-2
+            )
 
 
 def test_indexer_coarse_screen_rejects_other_sparse_count():
-    q_bar, w_bar, k_cache, block_table, seq = _build_data([1024, 1024])
+    g = 4
+    q, w, k_cache, block_table, seq, row_weights = _build_data([1024, 1024], g)
     dev = torch.device(DEVICE)
     with pytest.raises(RuntimeError):
         torch.ops._C_ascend.npu_indexer_coarse_screen(
-            q_bar.to(dev).contiguous(),
+            q.to(dev).contiguous(),
             k_cache.to(dev).contiguous(),
-            w_bar.to(dev).contiguous(),
-            actual_seq_lengths_query=torch.arange(1, 3, dtype=torch.int32, device=dev),
+            w.to(dev).contiguous(),
+            row_weights.to(dev).contiguous(),
+            actual_seq_lengths_query=torch.arange(
+                g, 2 * g + 1, g, dtype=torch.int32, device=dev
+            ),
             actual_seq_lengths_key=seq.to(dev),
             block_table=block_table.to(dev),
             layout_query="TND",

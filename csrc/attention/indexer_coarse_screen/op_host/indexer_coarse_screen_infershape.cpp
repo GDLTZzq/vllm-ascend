@@ -77,8 +77,10 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
         OP_LOGE(context, "row_weights must be rank-2 and its last dim g must be in (0, %ld], but got dim_num=%zu g=%ld.",
             MAX_GROUP_INFERSHAPE, rowWeightsShape->GetDimNum(), g),
         return ge::GRAPH_FAILED);
-    // 输出单行宽 = Align8(粗筛 topk 宽 + 池化组宽 g):行 = 粗筛 top-min(L,4096) + 自有 g token + -1 pad
-    int64_t outRowWidth = (static_cast<uint32_t>(*seleced_count) + static_cast<uint32_t>(g) + 7U) & ~7U;
+    // 输出单行宽 = Align8(sparse_count + 2*g − 1):行 = 排名 top-min(lo,4096) + 行尾
+    // 「组窗口∪自有」段(宽 ≤ 2*g − 1) + -1 pad
+    int64_t outRowWidth =
+        (static_cast<uint32_t>(*seleced_count) + 2U * static_cast<uint32_t>(g) - 1U + 7U) & ~7U;
     // 输出 TND 布局 [R, N2(恒 1), outRowWidth],R 为 batch(请求数)
     sparseIndicesShape->SetDimNum(3);
     sparseIndicesShape->SetDim(0, actualSeqQShape->GetDim(0)); // 0:Dim R(actual_seq_lengths_query 长度)

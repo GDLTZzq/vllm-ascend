@@ -84,7 +84,7 @@ inline uint32_t AlignUpTo8(uint32_t x)
 //   s1Size=TND 总 query 行(N=g 个 decode 头行/请求,pooling 用)
 //   s2Size=maxBlockNumPerBatch*blockSize(全前缀上界,非候选集宽度)
 //   sparseCount=coarseCount(topk 累加器宽度,输出 topk 宽;PIVOT 下恒 4096)
-//   gMax=row_weights.dim1(池化 group 宽 g,域 [0,L) 收缩用)  outRowWidth=Align8(sparseCount+gMax)(输出行宽)
+//   gMax=row_weights.dim1(池化 group 宽 g,排名域 [0,lo) 收缩用)  outRowWidth=Align8(sparseCount+2*gMax-1)(输出行宽)
 //   blockSize=PA block 大小   maxBlockNumPerBatch=block_table 宽(全前缀 gather 用)
 BEGIN_TILING_DATA_DEF(IndexerCoarseScreenTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
@@ -138,7 +138,7 @@ public:
     // Others Flag
     uint32_t sparseCount = 0; // coarseCount(输出 topk 宽度, PIVOT 下恒 4096)
     uint32_t gMax = 0;        // row_weights.dim1,池化 group 宽 g(域 [0,L) 收缩用)
-    uint32_t outRowWidth = 0; // 输出单行宽 = Align8(sparseCount + gMax)
+    uint32_t outRowWidth = 0; // 输出单行宽 = Align8(sparseCount + 2*gMax − 1)
     // DType
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKType = ge::DT_FLOAT16;
@@ -210,7 +210,7 @@ public:
     // Others Flag
     uint32_t sparseCount_ = 0; // coarseCount(输出 topk 宽度)
     uint32_t gMax_ = 0;        // row_weights.dim1,池化 group 宽 g(域 [0,L) 收缩用)
-    uint32_t outRowWidth_ = 0; // 输出单行宽 = Align8(sparseCount_ + gMax_)
+    uint32_t outRowWidth_ = 0; // 输出单行宽 = Align8(sparseCount_ + 2*gMax_ − 1)
     platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
     ge::DataType inputQType_ = ge::DT_FLOAT16;
     ge::DataType inputKType_ = ge::DT_FLOAT16;
